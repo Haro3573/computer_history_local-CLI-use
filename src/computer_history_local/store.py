@@ -21,7 +21,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 KIND_WINDOW = "window"
-# KIND_IDLE and KIND_BROWSER arrive with their own tickets.
+KIND_IDLE = "idle"
+# KIND_BROWSER arrives with its own ticket.
 
 DEFAULT_STORE = Path("~/.local/share/computer-history-local/state.sqlite3")
 DEFAULT_PULSETIME = timedelta(minutes=5)
@@ -34,19 +35,23 @@ CREATE TABLE IF NOT EXISTS state_samples (
     duration REAL    NOT NULL,
     app      TEXT,
     title    TEXT,
-    url      TEXT
+    url      TEXT,
+    away     INTEGER
 );
 CREATE INDEX IF NOT EXISTS state_samples_kind_at ON state_samples(kind, at);
 """
 
 
-def _key(app: str | None, title: str | None, url: str | None) -> tuple:
+def _key(app: str | None, title: str | None, url: str | None, away: bool | None) -> tuple:
     """What counts as "the same situation" for a merge decision.
 
     Shared by `Observation` and `Row` so the definition of sameness lives in
-    exactly one place.
+    exactly one place. `away` is part of the key deliberately: leaving a
+    boolean like this out looks harmless and silently merges idle=True with
+    idle=False into one situation that was true of neither (the exact bug
+    `adhd_lifelog`'s `activity_store.py` `state_key` docstring warns about).
     """
-    return (app, title, url)
+    return (app, title, url, away)
 
 
 @dataclass(frozen=True)
@@ -63,9 +68,10 @@ class Observation:
     app: str | None = None
     title: str | None = None
     url: str | None = None
+    away: bool | None = None
 
     def _data(self) -> tuple:
-        return _key(self.app, self.title, self.url)
+        return _key(self.app, self.title, self.url, self.away)
 
 
 @dataclass(frozen=True)
@@ -79,9 +85,10 @@ class Row:
     app: str | None
     title: str | None
     url: str | None
+    away: bool | None = None
 
     def _data(self) -> tuple:
-        return _key(self.app, self.title, self.url)
+        return _key(self.app, self.title, self.url, self.away)
 
     @property
     def confirmed_until(self) -> datetime:
@@ -147,6 +154,7 @@ def _row_from_sqlite(row: sqlite3.Row) -> Row:
         app=row["app"],
         title=row["title"],
         url=row["url"],
+        away=None if row["away"] is None else bool(row["away"]),
     )
 
 
@@ -160,7 +168,23 @@ class Store:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(_SCHEMA)
+        self._migrate()
         self._connection.commit()
+
+    def _migrate(self) -> None:
+        """Add columns a pre-existing database predates.
+
+        `CREATE TABLE IF NOT EXISTS` no-ops against a table that already
+        exists, so a database written before a column existed (e.g. `away`,
+        added in ticket #3) would otherwise never get it and every INSERT
+        naming that column would fail.
+        """
+        existing_columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(state_samples)")
+        }
+        if "away" not in existing_columns:
+            self._connection.execute("ALTER TABLE state_samples ADD COLUMN away INTEGER")
 
     def close(self) -> None:
         self._connection.close()
@@ -191,14 +215,15 @@ class Store:
             )
         else:
             self._connection.execute(
-                "INSERT INTO state_samples (kind, at, duration, app, title, url) "
-                "VALUES (?, ?, 0.0, ?, ?, ?)",
+                "INSERT INTO state_samples (kind, at, duration, app, title, url, away) "
+                "VALUES (?, ?, 0.0, ?, ?, ?, ?)",
                 (
                     observation.kind,
                     observation.at.timestamp(),
                     observation.app,
                     observation.title,
                     observation.url,
+                    None if observation.away is None else int(observation.away),
                 ),
             )
         self._connection.commit()

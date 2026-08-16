@@ -14,24 +14,42 @@ from typing import Callable
 from .redaction import DeterministicRedactor
 from .sampler import Sample
 from .sampler import sample as default_sample
-from .store import KIND_WINDOW, Observation, Store
+from .store import KIND_IDLE, KIND_WINDOW, Observation, Store
 
 DEFAULT_INTERVAL_SECONDS = 30.0
 
+# Past this you are not at the computer. Inherited from `mac_sampler.py`'s
+# own value rather than guessed fresh: "chosen to match the shortest gap that
+# reliably means 'left the desk' rather than 'read a paragraph'."
+DEFAULT_IDLE_THRESHOLD_SECONDS = 180.0
 
-def sample_to_events(reading: Sample) -> list[Observation]:
-    """Turn one reading into the window-kind observation it contains, if any.
 
-    Redaction happens here, before an `Observation` is ever constructed --
-    masking after the row is written would be too late (see `redaction.py`).
+def sample_to_events(
+    reading: Sample, *, idle_threshold: float = DEFAULT_IDLE_THRESHOLD_SECONDS
+) -> list[Observation]:
+    """Turn one reading into the independent facts it contains.
+
+    Idle/away and the frontmost window are two independent facts (ticket #3):
+    being away does not suppress the window kind -- unlike `adhd_lifelog`'s
+    `sample_to_events`, which deliberately does suppress it. Redaction
+    happens here, before an `Observation` is ever constructed -- masking
+    after the row is written would be too late (see `redaction.py`).
     """
-    if not reading.app:
-        return []
-    title = reading.title
-    if title:
-        redactor = DeterministicRedactor()
-        title, _ = redactor.redact(title)
-    return [Observation(kind=KIND_WINDOW, at=reading.at, app=reading.app, title=title)]
+    observations: list[Observation] = []
+
+    away = reading.idle_seconds >= idle_threshold
+    observations.append(Observation(kind=KIND_IDLE, at=reading.at, away=away))
+
+    if reading.app:
+        title = reading.title
+        if title:
+            redactor = DeterministicRedactor()
+            title, _ = redactor.redact(title)
+        observations.append(
+            Observation(kind=KIND_WINDOW, at=reading.at, app=reading.app, title=title)
+        )
+
+    return observations
 
 
 def run_once(

@@ -32,11 +32,20 @@ end tell
 return appName & "\\n" & winTitle
 """
 
+# Seconds since the last input event -- the only number that decides whether
+# you were at the desk. Absolute paths and /bin/sh, not `bash -lc`: under
+# launchd there is no login shell and PATH is a bare minimum (see #5).
+_IDLE = (
+    "/usr/sbin/ioreg -c IOHIDSystem | "
+    "/usr/bin/awk '/HIDIdleTime/ {print int($NF/1000000000); exit}'"
+)
+
 
 @dataclass(frozen=True)
 class Sample:
     app: str | None
     title: str | None
+    idle_seconds: float
     at: datetime
     errors: tuple[str, ...] = ()
 
@@ -75,4 +84,12 @@ def sample(*, now: datetime | None = None) -> Sample:
         app = parts[0].strip() or None
         title = (parts[1].strip() if len(parts) > 1 else "") or None
 
-    return Sample(app=app, title=title, at=now, errors=tuple(errors))
+    idle_output, idle_error = _run(["/bin/sh", "-c", _IDLE])
+    if idle_error:
+        errors.append(f"idle: {idle_error}")
+    try:
+        idle_seconds = float(idle_output) if idle_output else 0.0
+    except ValueError:
+        idle_seconds = 0.0
+
+    return Sample(app=app, title=title, idle_seconds=idle_seconds, at=now, errors=tuple(errors))
