@@ -16,6 +16,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.parse import urlsplit, urlunsplit
 
 _OSASCRIPT = "/usr/bin/osascript"
 
@@ -40,12 +41,45 @@ _IDLE = (
     "/usr/bin/awk '/HIDIdleTime/ {print int($NF/1000000000); exit}'"
 )
 
+_BROWSER_URL = {
+    "Google Chrome": 'tell application "Google Chrome" to return URL of active tab of front window',
+    "Safari": 'tell application "Safari" to return URL of front document',
+    "Arc": 'tell application "Arc" to return URL of active tab of front window',
+    "Brave Browser": 'tell application "Brave Browser" to return URL of active tab of front window',
+}
+
+
+def sanitize_browser_url(value: str | None) -> str | None:
+    """Keep only the http(s) origin and path; drop credentials, query, fragment.
+
+    A query string is where session tokens, one-time links and search terms
+    live. The origin and path answer "which site, roughly where" -- which is
+    all a State sample needs -- and everything discarded here never reaches
+    storage in the first place.
+    """
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return None
+        host = parsed.hostname.encode("idna").decode("ascii").lower()
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return urlunsplit((parsed.scheme.lower(), host, parsed.path or "/", "", ""))
+    except (UnicodeError, ValueError):
+        # A malformed hostname (an over-63-char label, empty label, a
+        # non-numeric port, etc.) must degrade to "no URL" like every other
+        # sampler failure -- never propagate and kill the polling loop.
+        return None
+
 
 @dataclass(frozen=True)
 class Sample:
     app: str | None
     title: str | None
     idle_seconds: float
+    url: str | None
     at: datetime
     errors: tuple[str, ...] = ()
 
@@ -92,4 +126,14 @@ def sample(*, now: datetime | None = None) -> Sample:
     except ValueError:
         idle_seconds = 0.0
 
-    return Sample(app=app, title=title, idle_seconds=idle_seconds, at=now, errors=tuple(errors))
+    url = None
+    script = _BROWSER_URL.get(app or "")
+    if script:
+        url_output, url_error = _run([_OSASCRIPT, "-e", script])
+        if url_error:
+            errors.append(f"browser: {url_error}")
+        url = (url_output or "").strip() or None
+
+    return Sample(
+        app=app, title=title, idle_seconds=idle_seconds, url=url, at=now, errors=tuple(errors)
+    )

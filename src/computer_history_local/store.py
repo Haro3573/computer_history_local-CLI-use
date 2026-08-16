@@ -22,7 +22,7 @@ from pathlib import Path
 
 KIND_WINDOW = "window"
 KIND_IDLE = "idle"
-# KIND_BROWSER arrives with its own ticket.
+KIND_BROWSER = "browser"
 
 DEFAULT_STORE = Path("~/.local/share/computer-history-local/state.sqlite3")
 DEFAULT_PULSETIME = timedelta(minutes=5)

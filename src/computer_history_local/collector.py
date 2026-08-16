@@ -12,9 +12,9 @@ import time
 from typing import Callable
 
 from .redaction import DeterministicRedactor
-from .sampler import Sample
+from .sampler import Sample, sanitize_browser_url
 from .sampler import sample as default_sample
-from .store import KIND_IDLE, KIND_WINDOW, Observation, Store
+from .store import KIND_BROWSER, KIND_IDLE, KIND_WINDOW, Observation, Store
 
 DEFAULT_INTERVAL_SECONDS = 30.0
 
@@ -29,24 +29,34 @@ def sample_to_events(
 ) -> list[Observation]:
     """Turn one reading into the independent facts it contains.
 
-    Idle/away and the frontmost window are two independent facts (ticket #3):
-    being away does not suppress the window kind -- unlike `adhd_lifelog`'s
-    `sample_to_events`, which deliberately does suppress it. Redaction
-    happens here, before an `Observation` is ever constructed -- masking
-    after the row is written would be too late (see `redaction.py`).
+    Idle/away, the frontmost window, and the browser URL are three
+    independent facts (tickets #3, #4): being away suppresses none of
+    them -- unlike `adhd_lifelog`'s `sample_to_events`, which deliberately
+    suppresses window and browser both under `if not away`. Redaction and
+    URL sanitization happen here, before an `Observation` is ever
+    constructed -- masking after the row is written would be too late (see
+    `redaction.py`).
     """
     observations: list[Observation] = []
 
     away = reading.idle_seconds >= idle_threshold
     observations.append(Observation(kind=KIND_IDLE, at=reading.at, away=away))
 
+    redactor = DeterministicRedactor()
+
     if reading.app:
         title = reading.title
         if title:
-            redactor = DeterministicRedactor()
             title, _ = redactor.redact(title)
         observations.append(
             Observation(kind=KIND_WINDOW, at=reading.at, app=reading.app, title=title)
+        )
+
+    url = sanitize_browser_url(reading.url)
+    if url:
+        url, _ = redactor.redact(url)
+        observations.append(
+            Observation(kind=KIND_BROWSER, at=reading.at, app=reading.app, url=url)
         )
 
     return observations
