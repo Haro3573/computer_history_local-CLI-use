@@ -5,7 +5,7 @@
     python -m computer_history_local uninstall
     python -m computer_history_local status [--store PATH]
     python -m computer_history_local summarize [--store PATH] [--memory-dir PATH]
-        [--provider {fake,claude-cli}] [--send]
+        [--provider {fake,claude-cli}] [--send] [--reprocess YYYY-MM-DD]
 
 `run` is what the LaunchAgent plist itself invokes
 (`launch_agent.build_plist`'s `ProgramArguments`) -- an explicit subcommand,
@@ -28,7 +28,9 @@ environment.
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
+from datetime import date
 from pathlib import Path
 
 from .collector import DEFAULT_INTERVAL_SECONDS, run_forever
@@ -67,6 +69,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # shape as `adhd_lifelog`'s `now --send`. Without it nothing is called
     # and nothing is written.
     summarize_parser.add_argument("--send", action="store_true")
+    # Force-reprocess exactly this day, even if already covered -- never
+    # touches the Watermark either way (ticket #16).
+    summarize_parser.add_argument("--reprocess", type=date.fromisoformat, default=None)
 
     return parser.parse_args(argv)
 
@@ -97,16 +102,37 @@ def main(argv: list[str] | None = None) -> None:
         if not args.send:
             print("dry run: pass --send to call the provider and write memories")
             return
+        if args.reprocess is not None and args.provider == "fake":
+            # --reprocess overwrites a real day's file+index (OR REPLACE)
+            # and never touches the Watermark either way -- if that
+            # overwrite lands placeholder text, no later plain run ever
+            # revisits the day to notice, since it's still "already
+            # covered." Silent, permanent data loss otherwise.
+            print(
+                "WARNING: --reprocess with --provider fake overwrites this day's real "
+                "Daily memory with placeholder text, permanently -- a later plain run "
+                "will never re-summarize it for real, since it's still 'already covered'."
+            )
         provider = FakeProvider() if args.provider == "fake" else ClaudeCliProvider()
-        with Store(store_path) as store, PipelineStore(store_path) as pipeline_store:
-            outcomes = summarize_once(store, pipeline_store, provider, memory_dir=memory_dir)
+        try:
+            with Store(store_path) as store, PipelineStore(store_path) as pipeline_store:
+                outcomes = summarize_once(
+                    store, pipeline_store, provider, memory_dir=memory_dir, reprocess=args.reprocess
+                )
+        except sqlite3.OperationalError as exc:
+            # The Collector runs concurrently as a long-lived launchd
+            # process against the same file (this project's normal
+            # deployment shape) -- opening the stores themselves, not just
+            # a later write, can hit lock contention.
+            print(f"failed to open the store: {exc}")
+            sys.exit(1)
         if not outcomes:
             print("nothing to summarize")
         for outcome in outcomes:
             if outcome.written:
                 print(f"wrote {outcome.day.isoformat()}")
             elif outcome.error is None:
-                print(f"skipped {outcome.day.isoformat()}: no data captured")
+                print(f"skipped {outcome.day.isoformat()}: {outcome.skipped_reason}")
             else:
                 print(f"failed {outcome.day.isoformat()}: {outcome.error}")
         return

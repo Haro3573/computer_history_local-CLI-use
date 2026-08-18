@@ -217,6 +217,131 @@ class SummarizeOutcome:
     day: date
     written: bool
     error: str | None = None
+    # Set only when `written` is False and `error` is None -- distinguishes
+    # *why* nothing happened (no data vs. already covered) so the CLI isn't
+    # stuck reporting "no data captured" for a day that in fact had plenty,
+    # just already summarized.
+    skipped_reason: str | None = None
+
+
+def _advance_watermark_past(
+    day: date, pipeline_store: PipelineStore, *, now: datetime
+) -> SummarizeOutcome | None:
+    """Advance past `day` with no provider call (nothing to summarize, or
+    it's already covered). Returns a failure outcome on lock contention,
+    `None` on success -- the caller appends `SummarizeOutcome(written=False)`
+    itself so both call sites read the same way."""
+    start_local, end_local = _local_day_bounds(day)
+    try:
+        pipeline_store.advance_watermark(end_local - timedelta(microseconds=1), now=now)
+    except sqlite3.OperationalError as exc:
+        return SummarizeOutcome(day=day, written=False, error=str(exc))
+    return None
+
+
+def _process_day(
+    day: date,
+    day_rows: list[Row],
+    pipeline_store: PipelineStore,
+    provider,
+    *,
+    memory_dir: Path,
+    content_cap_chars: int,
+    now: datetime,
+    advance_watermark: bool,
+) -> SummarizeOutcome:
+    """Chunk `day_rows`, call the provider once per chunk (`ADR-0007`), and
+    write the combined `Daily memory` file + `memory_index` row -- a day is
+    summarized completely or not at all, so any chunk failure fails the
+    whole day and nothing partial is written.
+
+    `advance_watermark` is `False` for an explicit `--reprocess`
+    (ticket #16's AC: an override must never move the `Watermark`) and
+    `True` for the normal pending-days loop (`ADR-0005`: only after a
+    successful write).
+    """
+    if not day_rows:
+        if advance_watermark:
+            # Nothing can retroactively appear for a past day -- the
+            # Collector never backfills -- so it's safe to advance past an
+            # empty day with no write at all, rather than leaving it
+            # pending forever. (The one intentional case where the
+            # Watermark moves without a write; ADR-0005's title is about
+            # never moving *without a successful outcome*, and "correctly
+            # identified as empty" is one.)
+            failure = _advance_watermark_past(day, pipeline_store, now=now)
+            if failure is not None:
+                return failure
+        return SummarizeOutcome(day=day, written=False, skipped_reason="no data captured")
+
+    chunks = day_chunks(day_rows, day, cap_chars=content_cap_chars)
+
+    if len(chunks) > MAX_CHUNKS_PER_DAY:
+        return SummarizeOutcome(
+            day=day,
+            written=False,
+            error=(
+                f"{len(chunks)} chunks needed (max {MAX_CHUNKS_PER_DAY}) -- "
+                "this day's data is unusually dense; check the Collector for "
+                "a runaway state (e.g. a title that changes every poll)."
+            ),
+        )
+
+    entries: list[TimelineEntry] = []
+    for chunk in chunks:
+        result = provider.summarize(
+            day, chunk.text, window_start=chunk.start, window_end=chunk.end
+        )
+        if result.state != DaySummaryState.COMPLETED:
+            return SummarizeOutcome(day=day, written=False, error=result.error_message)
+        entries.extend(result.entries)
+
+    markdown = render_daily_memory(day, tuple(entries))
+    start_local, end_local = _local_day_bounds(day)
+    path = memory_dir / f"{day.isoformat()}.md"
+    # Written to a temp path and only `replace()`d into `path` (an atomic
+    # rename on the same filesystem) after the DB write succeeds -- not
+    # written to `path` directly first. `record_memory` (`OR REPLACE`) is
+    # what lets `--reprocess` overwrite an existing row rather than
+    # accumulate a second one, but that also means a DB failure *after* an
+    # in-place file write would leave `path` holding new content while
+    # `memory_index` still names the old content_hash, and nothing
+    # revisits an already-covered day to notice. Lock contention with the
+    # concurrently-running Collector (this project's real deployment
+    # shape) is the realistic failure here, not a local rename -- ordering
+    # the DB write first means that far-more-likely failure leaves `path`
+    # untouched instead of silently wrong.
+    tmp_path = path.with_suffix(".md.tmp")
+    try:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_text(markdown, encoding="utf-8")
+        pipeline_store.record_memory(
+            MemoryIndexRow(
+                date=day.isoformat(),
+                path=str(path),
+                range_start=start_local,
+                range_end=end_local,
+                generated_at=now,
+                content_hash=hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
+            )
+        )
+        if advance_watermark:
+            # The last instant of `day`, not the start of the next one --
+            # so `watermark().date()` reads as "the last day that's
+            # covered," and `pending_days`'s `+ timedelta(days=1)` starts
+            # exactly one day later.
+            pipeline_store.advance_watermark(end_local - timedelta(microseconds=1), now=now)
+        tmp_path.replace(path)
+    except (sqlite3.OperationalError, OSError) as exc:
+        # The Collector runs concurrently as a long-lived launchd process
+        # writing to the same SQLite file (this project's own normal
+        # deployment shape) -- lock contention is a real, expected failure
+        # mode here, not a hypothetical one, and must degrade to a per-day
+        # failure rather than crash `summarize` outright.
+        tmp_path.unlink(missing_ok=True)
+        return SummarizeOutcome(day=day, written=False, error=str(exc))
+
+    return SummarizeOutcome(day=day, written=True)
 
 
 def summarize_once(
@@ -226,6 +351,7 @@ def summarize_once(
     *,
     memory_dir: Path = DEFAULT_MEMORY_DIR,
     content_cap_chars: int = DEFAULT_CONTENT_CAP_CHARS,
+    reprocess: date | None = None,
     now: datetime | None = None,
 ) -> list[SummarizeOutcome]:
     """One `summarize --send` run.
@@ -233,105 +359,91 @@ def summarize_once(
     Finds pending days; for each, splits its rows into one or more
     `cap_chars`-bounded chunks (`day_chunks`) and makes one provider call
     per chunk (`ADR-0007`) -- a day within the cap is exactly one chunk, one
-    call, no regression from the core ticket. All chunks' entries combine
-    into that day's single `Daily memory` file; the file granularity never
-    changes, only how many calls it took to fill it. If any chunk fails,
-    the whole day is treated as failed -- a day is summarized completely or
-    not at all, never partially. Writes the file + `memory_index` row and
-    advances the `Watermark` only once that day's write succeeds
-    (`ADR-0005`). Days process in chronological order and processing stops
-    at the first failure -- a later day can never be marked done while an
-    earlier one silently failed, which would break the Watermark's meaning
-    of "everything before this point is summarized."
+    call, no regression from the core ticket. Writes the file +
+    `memory_index` row and advances the `Watermark` only once that day's
+    write succeeds (`ADR-0005`). Days process in chronological order and
+    processing stops at the first failure -- a later day can never be
+    marked done while an earlier one silently failed, which would break the
+    Watermark's meaning of "everything before this point is summarized."
+
+    A day already covered by an existing `Daily memory` (checked directly
+    against `memory_index`, not just inferred from `Watermark` position --
+    a day can be recorded there without the `Watermark` yet reflecting it,
+    e.g. a crash between the two writes) is skipped before any provider
+    call, same as an empty day: no cost, no error, `Watermark` still
+    advances past it (ticket #16's AC).
+
+    `reprocess`, when given, ignores pending-days entirely and force-
+    reprocesses exactly that one day -- calls the provider and overwrites
+    its file+index even if already covered, and never touches the
+    `Watermark` either way (ticket #16's AC: an override must not move it
+    or change which days a later plain run considers already-covered).
     """
     now = now or datetime.now(UTC)
+    memory_dir = memory_dir.expanduser()
+
+    if reprocess is not None:
+        if reprocess >= now.astimezone().date():
+            return [
+                SummarizeOutcome(
+                    day=reprocess,
+                    written=False,
+                    error="cannot reprocess today or a future date -- it isn't complete yet",
+                )
+            ]
+        day_rows = rows_for_day(store.rows(), reprocess)
+        return [
+            _process_day(
+                reprocess,
+                day_rows,
+                pipeline_store,
+                provider,
+                memory_dir=memory_dir,
+                content_cap_chars=content_cap_chars,
+                now=now,
+                advance_watermark=False,
+            )
+        ]
+
     all_rows = store.rows()
     earliest = min((row.at for row in all_rows), default=None)
     watermark = pipeline_store.watermark()
     days = pending_days(watermark=watermark, earliest=earliest, now=now)
 
     outcomes: list[SummarizeOutcome] = []
-    memory_dir = memory_dir.expanduser()
 
     for day in days:
-        day_rows = rows_for_day(all_rows, day)
-
-        if not day_rows:
-            # Nothing captured -- no reason to spend a paid provider call
-            # summarizing an empty day. Nothing can retroactively appear for
-            # a past day (the Collector never backfills), so it's safe to
-            # advance past it rather than leaving it pending forever.
-            start_local, end_local = _local_day_bounds(day)
-            try:
-                pipeline_store.advance_watermark(end_local - timedelta(microseconds=1), now=now)
-            except sqlite3.OperationalError as exc:
-                outcomes.append(SummarizeOutcome(day=day, written=False, error=str(exc)))
-                break
-            outcomes.append(SummarizeOutcome(day=day, written=False))
-            continue
-
-        chunks = day_chunks(day_rows, day, cap_chars=content_cap_chars)
-
-        if len(chunks) > MAX_CHUNKS_PER_DAY:
-            outcomes.append(
-                SummarizeOutcome(
-                    day=day,
-                    written=False,
-                    error=(
-                        f"{len(chunks)} chunks needed (max {MAX_CHUNKS_PER_DAY}) -- "
-                        "this day's data is unusually dense; check the Collector for "
-                        "a runaway state (e.g. a title that changes every poll)."
-                    ),
-                )
-            )
-            break
-
-        entries: list[TimelineEntry] = []
-        failure: str | None = None
-        for chunk in chunks:
-            result = provider.summarize(
-                day, chunk.text, window_start=chunk.start, window_end=chunk.end
-            )
-            if result.state != DaySummaryState.COMPLETED:
-                failure = result.error_message
-                break
-            entries.extend(result.entries)
-
-        if failure is not None:
-            outcomes.append(SummarizeOutcome(day=day, written=False, error=failure))
-            break
-
-        markdown = render_daily_memory(day, tuple(entries))
-        start_local, end_local = _local_day_bounds(day)
-        path = memory_dir / f"{day.isoformat()}.md"
         try:
-            memory_dir.mkdir(parents=True, exist_ok=True)
-            path.write_text(markdown, encoding="utf-8")
-            pipeline_store.record_memory(
-                MemoryIndexRow(
-                    date=day.isoformat(),
-                    path=str(path),
-                    range_start=start_local,
-                    range_end=end_local,
-                    generated_at=now,
-                    content_hash=hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
-                )
-            )
-            # The last instant of `day`, not the start of the next one --
-            # so `watermark().date()` reads as "the last day that's
-            # covered," and `pending_days`'s `+ timedelta(days=1)` starts
-            # exactly one day later.
-            pipeline_store.advance_watermark(end_local - timedelta(microseconds=1), now=now)
-        except (sqlite3.OperationalError, OSError) as exc:
-            # The Collector runs concurrently as a long-lived launchd
-            # process writing to the same SQLite file (this project's own
-            # normal deployment shape) -- lock contention is a real,
-            # expected failure mode here, not a hypothetical one, and must
-            # degrade to a per-day failure rather than crash `summarize`
-            # outright and lose the outcomes already collected this run.
+            already_covered = bool(pipeline_store.memories_for_date(day.isoformat()))
+        except sqlite3.OperationalError as exc:
+            # Same lock-contention risk as every other store call in this
+            # loop -- a SELECT is not exempt just because it doesn't write.
             outcomes.append(SummarizeOutcome(day=day, written=False, error=str(exc)))
             break
 
-        outcomes.append(SummarizeOutcome(day=day, written=True))
+        if already_covered:
+            failure = _advance_watermark_past(day, pipeline_store, now=now)
+            if failure is not None:
+                outcomes.append(failure)
+                break
+            outcomes.append(
+                SummarizeOutcome(day=day, written=False, skipped_reason="already covered")
+            )
+            continue
+
+        day_rows = rows_for_day(all_rows, day)
+        outcome = _process_day(
+            day,
+            day_rows,
+            pipeline_store,
+            provider,
+            memory_dir=memory_dir,
+            content_cap_chars=content_cap_chars,
+            now=now,
+            advance_watermark=True,
+        )
+        outcomes.append(outcome)
+        if outcome.error is not None:
+            break
 
     return outcomes

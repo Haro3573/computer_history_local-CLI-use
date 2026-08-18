@@ -37,8 +37,11 @@ CREATE TABLE IF NOT EXISTS memory_index (
     generated_at  REAL NOT NULL,
     content_hash  TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS memory_index_date ON memory_index(date);
 """
+# The unique index isn't created here: a fresh table's column-level UNIQUE
+# already covers it, but for a pre-existing table (`_migrate`'s job) this
+# same statement would run *before* the dedup that has to happen first --
+# creating a unique index over data that already violates it fails outright.
 
 # The Collector runs concurrently as a long-lived launchd process writing to
 # this same file (this project's normal deployment shape, not a hypothetical
@@ -81,7 +84,48 @@ class PipelineStore:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(_SCHEMA)
+        self._migrate()
         self._connection.commit()
+
+    def _migrate(self) -> None:
+        """Retrofit `memory_index`'s `UNIQUE(date)` index onto a database
+        created before ticket #16 added it -- `CREATE TABLE IF NOT EXISTS`
+        never alters an existing table (the same class of gap `store.py`'s
+        own `_migrate` fixed for its `away` column), so a pre-existing
+        `memory_index` silently kept accepting duplicate rows per date,
+        defeating `record_memory`'s `INSERT OR REPLACE` contract.
+
+        Skipped entirely once *any* unique index already covers the table
+        -- a fresh table's column-level `UNIQUE` constraint already is one
+        (SQLite backs it with an auto-generated index name, not this
+        method's own), so this isn't just an optimization: creating a
+        second, explicitly-named unique index unconditionally would add
+        permanent, redundant index-maintenance cost to every future
+        `record_memory` write on every fresh install, not only databases
+        that actually needed migrating.
+
+        The `DELETE` -- needed only pre-migration, to satisfy a unique
+        index about to be created over data that may already violate it --
+        is this package's first ever, and is invisible to
+        `test_store.py`'s `test_only_update_statement_in_package_touches_duration`
+        (that scan is `UPDATE ... SET` only, not `DELETE`); a parallel
+        `test_only_delete_statement_in_package_is_the_memory_index_dedupe`
+        extends the same guard rather than leaving this one path to quietly
+        rely on a check that was never watching it.
+        """
+        has_unique_index = any(
+            row["unique"]
+            for row in self._connection.execute("PRAGMA index_list(memory_index)")
+        )
+        if has_unique_index:
+            return
+        self._connection.execute(
+            "DELETE FROM memory_index WHERE id NOT IN "
+            "(SELECT MAX(id) FROM memory_index GROUP BY date)"
+        )
+        self._connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS memory_index_date_unique ON memory_index(date)"
+        )
 
     def close(self) -> None:
         self._connection.close()
