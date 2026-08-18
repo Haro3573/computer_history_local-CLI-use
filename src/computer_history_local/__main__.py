@@ -35,7 +35,7 @@ from pathlib import Path
 
 from .collector import DEFAULT_INTERVAL_SECONDS, run_forever
 from .launch_agent import install, status, uninstall
-from .memory_pipeline import DEFAULT_MEMORY_DIR, summarize_once
+from .memory_pipeline import DEFAULT_MEMORY_DIR, preview, summarize_once
 from .pipeline_store import PipelineStore
 from .providers.claude_cli import ClaudeCliProvider
 from .providers.fake import FakeProvider
@@ -100,7 +100,36 @@ def main(argv: list[str] | None = None) -> None:
         store_path = args.store if args.store is not None else DEFAULT_STORE
         memory_dir = args.memory_dir if args.memory_dir is not None else DEFAULT_MEMORY_DIR
         if not args.send:
-            print("dry run: pass --send to call the provider and write memories")
+            # Free, no-network preview -- no provider call, no write. Uses
+            # the exact same day-batching/coverage-check/splitting logic
+            # `summarize_once` does, not a separate implementation that
+            # could drift from what a real run would actually do.
+            try:
+                with Store(store_path) as store, PipelineStore(store_path) as pipeline_store:
+                    previews = preview(store, pipeline_store, reprocess=args.reprocess)
+            except sqlite3.OperationalError as exc:
+                print(f"failed to open the store: {exc}")
+                sys.exit(1)
+            if not previews:
+                print("nothing to summarize")
+                return
+            for day_preview in previews:
+                label = day_preview.day.isoformat()
+                if day_preview.error is not None:
+                    print(f"{label}: {day_preview.error}")
+                elif day_preview.already_covered:
+                    print(f"{label}: already covered")
+                elif not day_preview.chunks:
+                    print(f"{label}: no data captured")
+                else:
+                    print(f"{label}: {len(day_preview.chunks)} chunk(s)")
+                    for index, chunk in enumerate(day_preview.chunks, start=1):
+                        start_local = chunk.start.astimezone()
+                        end_local = chunk.end.astimezone()
+                        print(f"--- chunk {index}: {start_local:%H:%M}–{end_local:%H:%M} ---")
+                        print(chunk.text)
+            print()
+            print("pass --send to call the provider and write memories")
             return
         if args.reprocess is not None and args.provider == "fake":
             # --reprocess overwrites a real day's file+index (OR REPLACE)

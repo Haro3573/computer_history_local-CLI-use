@@ -239,6 +239,25 @@ def _advance_watermark_past(
     return None
 
 
+def _chunks_or_error(
+    day_rows: list[Row], day: date, *, content_cap_chars: int
+) -> tuple[list[Chunk], str | None]:
+    """Chunk `day_rows` and check `MAX_CHUNKS_PER_DAY` -- shared by
+    `_process_day` and `preview()` so the two structurally can't drift on
+    what counts as "too many chunks" for a day. They already did once:
+    `preview()` reported a chunk count for a day a real run would actually
+    refuse, directly the class of drift ticket #17's own AC warns against
+    ("no separate, drifting preview implementation")."""
+    chunks = day_chunks(day_rows, day, cap_chars=content_cap_chars)
+    if len(chunks) > MAX_CHUNKS_PER_DAY:
+        return chunks, (
+            f"{len(chunks)} chunks needed (max {MAX_CHUNKS_PER_DAY}) -- "
+            "this day's data is unusually dense; check the Collector for "
+            "a runaway state (e.g. a title that changes every poll)."
+        )
+    return chunks, None
+
+
 def _process_day(
     day: date,
     day_rows: list[Row],
@@ -274,18 +293,9 @@ def _process_day(
                 return failure
         return SummarizeOutcome(day=day, written=False, skipped_reason="no data captured")
 
-    chunks = day_chunks(day_rows, day, cap_chars=content_cap_chars)
-
-    if len(chunks) > MAX_CHUNKS_PER_DAY:
-        return SummarizeOutcome(
-            day=day,
-            written=False,
-            error=(
-                f"{len(chunks)} chunks needed (max {MAX_CHUNKS_PER_DAY}) -- "
-                "this day's data is unusually dense; check the Collector for "
-                "a runaway state (e.g. a title that changes every poll)."
-            ),
-        )
+    chunks, error = _chunks_or_error(day_rows, day, content_cap_chars=content_cap_chars)
+    if error is not None:
+        return SummarizeOutcome(day=day, written=False, error=error)
 
     entries: list[TimelineEntry] = []
     for chunk in chunks:
@@ -447,3 +457,81 @@ def summarize_once(
             break
 
     return outcomes
+
+
+@dataclass(frozen=True)
+class DayPreview:
+    day: date
+    already_covered: bool = False
+    chunks: tuple[Chunk, ...] = ()
+    # Set for a refused --reprocess (today or a future date), a day that
+    # would exceed MAX_CHUNKS_PER_DAY, or a store read that hit lock
+    # contention -- anything a real `summarize --send` run would also
+    # refuse or fail on, so the preview never claims success for a day
+    # that wouldn't actually happen.
+    error: str | None = None
+
+
+def preview(
+    store: Store,
+    pipeline_store: PipelineStore,
+    *,
+    content_cap_chars: int = DEFAULT_CONTENT_CAP_CHARS,
+    reprocess: date | None = None,
+    now: datetime | None = None,
+) -> list[DayPreview]:
+    """What the next `summarize --send` run would do -- no provider call,
+    no write, not even a `Watermark` read's result acted on.
+
+    Walks the exact same decision tree as `summarize_once` (pending days,
+    the `memory_index` coverage check, `_chunks_or_error`'s splitting +
+    `MAX_CHUNKS_PER_DAY` check) using the same underlying functions, not a
+    separate reimplementation that could drift from what a real run
+    actually does (ticket #17's AC). The one thing it never does is call
+    `_process_day` -- nothing here writes a file, records an index row, or
+    advances the `Watermark`.
+    """
+    now = now or datetime.now(UTC)
+
+    if reprocess is not None:
+        if reprocess >= now.astimezone().date():
+            return [
+                DayPreview(
+                    day=reprocess,
+                    error="cannot reprocess today or a future date -- it isn't complete yet",
+                )
+            ]
+        day_rows = rows_for_day(store.rows(), reprocess)
+        if not day_rows:
+            return [DayPreview(day=reprocess)]
+        chunks, error = _chunks_or_error(day_rows, reprocess, content_cap_chars=content_cap_chars)
+        return [DayPreview(day=reprocess, chunks=tuple(chunks), error=error)]
+
+    all_rows = store.rows()
+    earliest = min((row.at for row in all_rows), default=None)
+    watermark = pipeline_store.watermark()
+    days = pending_days(watermark=watermark, earliest=earliest, now=now)
+
+    previews: list[DayPreview] = []
+    for day in days:
+        try:
+            already_covered = bool(pipeline_store.memories_for_date(day.isoformat()))
+        except sqlite3.OperationalError as exc:
+            # Same lock-contention risk `summarize_once`'s equivalent
+            # check guards against -- a mid-loop failure here must not
+            # propagate uncaught and discard the previews already
+            # computed for earlier days.
+            previews.append(DayPreview(day=day, error=str(exc)))
+            break
+
+        if already_covered:
+            previews.append(DayPreview(day=day, already_covered=True))
+            continue
+
+        day_rows = rows_for_day(all_rows, day)
+        if not day_rows:
+            previews.append(DayPreview(day=day))
+            continue
+        chunks, error = _chunks_or_error(day_rows, day, content_cap_chars=content_cap_chars)
+        previews.append(DayPreview(day=day, chunks=tuple(chunks), error=error))
+    return previews
