@@ -19,7 +19,7 @@ import json
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
@@ -235,15 +235,25 @@ class ClaudeCliProvider:
     runner: CliRunner = subprocess_runner
     provider_id: str = CLAUDE_CLI_PROVIDER_ID
 
-    def build_prompt(self, day: date, day_text: str) -> str:
+    def build_prompt(
+        self, day: date, day_text: str, *, window_start: datetime, window_end: datetime
+    ) -> str:
+        # Always states the actual window, whether it happens to be the
+        # whole day or a chunk of it (ticket #15): the model is never told
+        # "summarize the day" while holding only a fraction of it, which
+        # otherwise leaves no signal against narrating past this call's own
+        # slice or inventing what happened in the hours it wasn't given.
         return (
             "You have no tools. Do not attempt to read files, run commands, "
             "or search. Everything you need is in the data below.\n\n"
-            f"Summarize this person's {day.isoformat()} into a timeline of "
-            "what they were doing, based only on the app/window/idle/browser "
-            "data below. Group nearby activity into a small number of "
-            "time-range entries; do not invent detail the data doesn't "
-            "support.\n\n"
+            "Summarize this person's activity between "
+            f"{window_start.astimezone():%H:%M} and {window_end.astimezone():%H:%M} "
+            f"on {day.isoformat()}, based only on the app/window/idle/browser "
+            "data below. This may be only part of the day -- other separate "
+            "calls cover the rest, so do not comment on or invent activity "
+            "outside this window. Group nearby activity into a small number "
+            "of time-range entries within this window; do not invent detail "
+            "the data doesn't support.\n\n"
             "Answer with a single JSON object and nothing else. No prose, "
             "no markdown fence, no explanation. Shape:\n"
             '{"entries": [{"time_range": "HH:MM–HH:MM", "summary": '
@@ -251,7 +261,9 @@ class ClaudeCliProvider:
             f"Data:\n{day_text}\n"
         )
 
-    def summarize(self, day: date, day_text: str) -> DaySummaryResult:
+    def summarize(
+        self, day: date, day_text: str, *, window_start: datetime, window_end: datetime
+    ) -> DaySummaryResult:
         def failure(state: DaySummaryState, message: str) -> DaySummaryResult:
             return DaySummaryResult(state=state, error_message=message)
 
@@ -262,7 +274,7 @@ class ClaudeCliProvider:
                 f"{self.config.executable} is not on PATH.",
             )
 
-        prompt = self.build_prompt(day, day_text)
+        prompt = self.build_prompt(day, day_text, window_start=window_start, window_end=window_end)
         command = self.config.command_for(prompt)
         command[0] = resolved
         try:

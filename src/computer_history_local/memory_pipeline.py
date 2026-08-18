@@ -27,6 +27,28 @@ from .store import KIND_BROWSER, KIND_IDLE, KIND_WINDOW, Row, Store
 
 DEFAULT_MEMORY_DIR = Path("~/.local/share/computer-history-local/memories")
 
+# A deliberately conservative starting number, not derived from any hard
+# model/context limit (Sonnet's window is far larger) -- ADR-0007's whole
+# point is keeping one unit of work small for a future small/local model,
+# not maximizing what fits in one call. Tunable; nothing else depends on
+# this exact value.
+DEFAULT_CONTENT_CAP_CHARS = 4000
+
+# Below this, a window stops splitting even if still over cap -- a single
+# row's own formatted line can't be shrunk further, and this floor (twice
+# the Collector's own poll interval) keeps recursion from chasing
+# millisecond-scale windows on a pathological input.
+MIN_CHUNK_WINDOW = timedelta(minutes=1)
+
+# A day needing more chunks than this fails outright instead of silently
+# making that many real, Pro-subscription-backed provider calls. Without a
+# cap, a window whose title changes every poll (a live counter, a download
+# percentage) defeats Store's Pulsetime merge and produces one row roughly
+# every 30 seconds all day -- MIN_CHUNK_WINDOW alone lets that recurse to
+# 1,000+ leaf chunks with no warning. 24 is generous (roughly one chunk per
+# hour) for any day that isn't already degenerate in this way.
+MAX_CHUNKS_PER_DAY = 24
+
 
 def pending_days(
     *, watermark: datetime | None, earliest: datetime | None, now: datetime
@@ -111,6 +133,69 @@ def format_day_for_prompt(rows: list[Row]) -> str:
     return "\n".join(lines)
 
 
+def _assignment_time(row: Row, window_start: datetime) -> datetime:
+    """The timestamp used to bucket a row into a chunk: the row's own local
+    start, or the window's start if the row began before it. A row that
+    started the previous day and merged past midnight (`rows_for_day`
+    includes it via interval overlap, not a same-day `at`) would otherwise
+    fall outside every sub-window of *this* day and silently vanish from
+    every chunk instead of landing in the first one."""
+    local_at = row.at.astimezone()
+    return local_at if local_at > window_start else window_start
+
+
+@dataclass(frozen=True)
+class Chunk:
+    start: datetime
+    end: datetime
+    rows: list[Row]
+    text: str  # `format_day_for_prompt(rows)`, computed once and reused --
+    # not recomputed by the caller for the same rows.
+
+
+def day_chunks(
+    rows: list[Row], day: date, *, cap_chars: int = DEFAULT_CONTENT_CAP_CHARS
+) -> list[Chunk]:
+    """Split `day`'s rows into `Chunk`s, each formatting to at most
+    `cap_chars` -- recursively halving the local-time window when a chunk
+    is still over cap. Unlike `rows_for_day`'s deliberate duplication
+    across adjacent days, a row here is assigned to exactly one chunk
+    (`_assignment_time`): the same day's rows feed one output file, so
+    counting a row twice would summarize it twice.
+
+    Only non-empty chunks are returned -- ticket #14 already established
+    "no data, no provider call" for a whole day; the same principle applies
+    to a sub-day chunk with nothing in it.
+    """
+    day_start, day_end = _local_day_bounds(day)
+    return [
+        chunk
+        for chunk in _split_window(rows, day_start, day_end, day_start=day_start, cap_chars=cap_chars)
+        if chunk.rows
+    ]
+
+
+def _split_window(
+    rows: list[Row],
+    start: datetime,
+    end: datetime,
+    *,
+    day_start: datetime,
+    cap_chars: int,
+) -> list[Chunk]:
+    # `rows` is already this node's own subset -- each recursive call below
+    # passes its half, not the full day, so re-filtering at depth N scans
+    # only that branch's rows, not the whole day's every time.
+    window_rows = [row for row in rows if start <= _assignment_time(row, day_start) < end]
+    text = format_day_for_prompt(window_rows)
+    if len(text) <= cap_chars or (end - start) <= MIN_CHUNK_WINDOW or not window_rows:
+        return [Chunk(start=start, end=end, rows=window_rows, text=text)]
+    mid = start + (end - start) / 2
+    return _split_window(
+        window_rows, start, mid, day_start=day_start, cap_chars=cap_chars
+    ) + _split_window(window_rows, mid, end, day_start=day_start, cap_chars=cap_chars)
+
+
 def render_daily_memory(day: date, entries: tuple[TimelineEntry, ...]) -> str:
     """Structured timeline entries -> the actual `Daily memory` Markdown
     (`CONTEXT.md`: "time range -> summary -> contributing apps", not
@@ -140,17 +225,24 @@ def summarize_once(
     provider,
     *,
     memory_dir: Path = DEFAULT_MEMORY_DIR,
+    content_cap_chars: int = DEFAULT_CONTENT_CAP_CHARS,
     now: datetime | None = None,
 ) -> list[SummarizeOutcome]:
     """One `summarize --send` run.
 
-    Finds pending days, makes one provider call per day (`ADR-0007`), writes
-    the `Daily memory` file + `memory_index` row, and advances the
-    `Watermark` only once that day's write succeeds (`ADR-0005`). Days
-    process in chronological order and processing stops at the first
-    failure -- a later day can never be marked done while an earlier one
-    silently failed, which would break the Watermark's meaning of
-    "everything before this point is summarized."
+    Finds pending days; for each, splits its rows into one or more
+    `cap_chars`-bounded chunks (`day_chunks`) and makes one provider call
+    per chunk (`ADR-0007`) -- a day within the cap is exactly one chunk, one
+    call, no regression from the core ticket. All chunks' entries combine
+    into that day's single `Daily memory` file; the file granularity never
+    changes, only how many calls it took to fill it. If any chunk fails,
+    the whole day is treated as failed -- a day is summarized completely or
+    not at all, never partially. Writes the file + `memory_index` row and
+    advances the `Watermark` only once that day's write succeeds
+    (`ADR-0005`). Days process in chronological order and processing stops
+    at the first failure -- a later day can never be marked done while an
+    earlier one silently failed, which would break the Watermark's meaning
+    of "everything before this point is summarized."
     """
     now = now or datetime.now(UTC)
     all_rows = store.rows()
@@ -178,14 +270,38 @@ def summarize_once(
             outcomes.append(SummarizeOutcome(day=day, written=False))
             continue
 
-        day_text = format_day_for_prompt(day_rows)
-        result = provider.summarize(day, day_text)
+        chunks = day_chunks(day_rows, day, cap_chars=content_cap_chars)
 
-        if result.state != DaySummaryState.COMPLETED:
-            outcomes.append(SummarizeOutcome(day=day, written=False, error=result.error_message))
+        if len(chunks) > MAX_CHUNKS_PER_DAY:
+            outcomes.append(
+                SummarizeOutcome(
+                    day=day,
+                    written=False,
+                    error=(
+                        f"{len(chunks)} chunks needed (max {MAX_CHUNKS_PER_DAY}) -- "
+                        "this day's data is unusually dense; check the Collector for "
+                        "a runaway state (e.g. a title that changes every poll)."
+                    ),
+                )
+            )
             break
 
-        markdown = render_daily_memory(day, result.entries)
+        entries: list[TimelineEntry] = []
+        failure: str | None = None
+        for chunk in chunks:
+            result = provider.summarize(
+                day, chunk.text, window_start=chunk.start, window_end=chunk.end
+            )
+            if result.state != DaySummaryState.COMPLETED:
+                failure = result.error_message
+                break
+            entries.extend(result.entries)
+
+        if failure is not None:
+            outcomes.append(SummarizeOutcome(day=day, written=False, error=failure))
+            break
+
+        markdown = render_daily_memory(day, tuple(entries))
         start_local, end_local = _local_day_bounds(day)
         path = memory_dir / f"{day.isoformat()}.md"
         try:
