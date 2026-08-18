@@ -1,9 +1,11 @@
-"""Run the collector, or manage its LaunchAgent.
+"""Run the collector, manage its LaunchAgent, or summarize into local memory.
 
     python -m computer_history_local run [--store PATH] [--interval SECONDS]
     python -m computer_history_local install [--store PATH] [--interval SECONDS]
     python -m computer_history_local uninstall
     python -m computer_history_local status [--store PATH]
+    python -m computer_history_local summarize [--store PATH] [--memory-dir PATH]
+        [--provider {fake,claude-cli}] [--send]
 
 `run` is what the LaunchAgent plist itself invokes
 (`launch_agent.build_plist`'s `ProgramArguments`) -- an explicit subcommand,
@@ -31,6 +33,10 @@ from pathlib import Path
 
 from .collector import DEFAULT_INTERVAL_SECONDS, run_forever
 from .launch_agent import install, status, uninstall
+from .memory_pipeline import DEFAULT_MEMORY_DIR, summarize_once
+from .pipeline_store import PipelineStore
+from .providers.claude_cli import ClaudeCliProvider
+from .providers.fake import FakeProvider
 from .store import DEFAULT_STORE, Store
 
 
@@ -50,6 +56,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     status_parser = subparsers.add_parser("status", help="Print collector health")
     status_parser.add_argument("--store", type=Path, default=None)
+
+    summarize_parser = subparsers.add_parser(
+        "summarize", help="Turn captured State samples into Daily memory files"
+    )
+    summarize_parser.add_argument("--store", type=Path, default=None)
+    summarize_parser.add_argument("--memory-dir", type=Path, default=None)
+    summarize_parser.add_argument("--provider", choices=("fake", "claude-cli"), default="fake")
+    # Off by default -- Transfer's own consent gate (CONTEXT.md), the same
+    # shape as `adhd_lifelog`'s `now --send`. Without it nothing is called
+    # and nothing is written.
+    summarize_parser.add_argument("--send", action="store_true")
 
     return parser.parse_args(argv)
 
@@ -72,6 +89,26 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "status":
         store_path = args.store if args.store is not None else DEFAULT_STORE
         print(status(store_path=store_path))
+        return
+
+    if args.command == "summarize":
+        store_path = args.store if args.store is not None else DEFAULT_STORE
+        memory_dir = args.memory_dir if args.memory_dir is not None else DEFAULT_MEMORY_DIR
+        if not args.send:
+            print("dry run: pass --send to call the provider and write memories")
+            return
+        provider = FakeProvider() if args.provider == "fake" else ClaudeCliProvider()
+        with Store(store_path) as store, PipelineStore(store_path) as pipeline_store:
+            outcomes = summarize_once(store, pipeline_store, provider, memory_dir=memory_dir)
+        if not outcomes:
+            print("nothing to summarize")
+        for outcome in outcomes:
+            if outcome.written:
+                print(f"wrote {outcome.day.isoformat()}")
+            elif outcome.error is None:
+                print(f"skipped {outcome.day.isoformat()}: no data captured")
+            else:
+                print(f"failed {outcome.day.isoformat()}: {outcome.error}")
         return
 
     # args.command == "run"
