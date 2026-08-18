@@ -21,8 +21,9 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
+from .collector import DEFAULT_INTERVAL_SECONDS
 from .pipeline_store import MemoryIndexRow, PipelineStore
-from .providers.claude_cli import DaySummaryState, TimelineEntry
+from .providers.claude_cli import DaySummaryState
 from .store import KIND_BROWSER, KIND_IDLE, KIND_WINDOW, Row, Store
 
 DEFAULT_MEMORY_DIR = Path("~/.local/share/computer-history-local/memories")
@@ -48,6 +49,164 @@ MIN_CHUNK_WINDOW = timedelta(minutes=1)
 # 1,000+ leaf chunks with no warning. 24 is generous (roughly one chunk per
 # hour) for any day that isn't already degenerate in this way.
 MAX_CHUNKS_PER_DAY = 24
+
+SPAN_KIND_WINDOW = "window"
+SPAN_KIND_AWAY = "away"
+
+# The ordinary gap between two polls of the same, still-open app (a title
+# changing every poll defeats Store's Pulsetime merge, which only fires on
+# an *unchanged* sample) -- mirrors adhd_lifelog's own
+# `STALE_AFTER_SECONDS = DEFAULT_KEEPALIVE_SECONDS * 3` for the same reason:
+# without this tolerance, ordinary continuous work fragments into one span
+# per poll tick. A gap larger than this needs `_idle_covers_away` to bridge
+# instead -- this alone only closes the small, expected gap between polls.
+WINDOW_MERGE_TOLERANCE = timedelta(seconds=DEFAULT_INTERVAL_SECONDS * 3)
+
+
+@dataclass(frozen=True)
+class TimelineEntry:
+    """One structured entry in a `Daily memory` -- CONTEXT.md's "time range →
+    summary → contributing apps" shape, not free-form prose. Built by code
+    from a `Span` plus (for a window span) the provider's one summary
+    sentence -- `time_range` and `apps` are never model output (ticket #23:
+    the model can't get a field right that it never gets to guess)."""
+
+    time_range: str
+    summary: str
+    apps: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Span:
+    """A contiguous stretch of one app's use, or a stretch away from the
+    computer -- ticket #23's replacement for the model deciding segment
+    boundaries on its own. `kind` is `SPAN_KIND_WINDOW` or `SPAN_KIND_AWAY`;
+    an away span carries no `apps` -- rendering one would claim continuous
+    app engagement across a stretch the person wasn't at the desk for, the
+    same false claim `adhd_lifelog`'s "돌아옴" row removal and
+    `_asleep_spans`'s window-channel contradiction check both already guard
+    against."""
+
+    kind: str
+    start: datetime
+    end: datetime
+    apps: tuple[str, ...]
+    rows: list[Row]
+
+
+def _idle_covers_away(idle_rows: list[Row], start: datetime, end: datetime) -> bool:
+    """Whether nothing overlapping `[start, end)` shows real `idle: active`
+    evidence -- i.e. whether the gap can be bridged.
+
+    Started out requiring at least one `away`-marked row to actually cover
+    the gap, on the theory that a real gap in what was recorded is not
+    evidence of anything. A real `--reprocess 2026-08-17 --send` run against
+    the exact stretch this rule exists for (24 same-app pings through a
+    `Maintenance Sleep`/`DarkWake` cycle) falsified that: while the machine
+    is genuinely asleep, the Collector itself isn't running, so *no* idle
+    row -- `away` or otherwise -- overlaps most of these gaps at all. The
+    stricter rule produced 63 one-row spans instead of one away span,
+    exactly the fragmentation ticket #23 was resolved to prevent. A model
+    given that same silent gap would have had nothing to say about it
+    either way, so treating "no data" as bridgeable doesn't lose information
+    the old, unredesigned system had -- it only changes the label from an
+    app claiming continuity it can't back up to `away`.
+
+    The one thing this still refuses to paper over is *real* activity
+    evidence: an `idle: active` row genuinely overlapping the gap (not just
+    touching its boundary, which is often the OS's own idle-timer reset
+    right after a wake, not a real return) still blocks the bridge.
+    """
+    for idle_row in idle_rows:
+        if idle_row.confirmed_until <= start or idle_row.at >= end:
+            continue
+        if not idle_row.away:
+            return False
+    return True
+
+
+def build_spans(rows: list[Row]) -> list[Span]:
+    """Deterministically group `rows` into `Span`s -- ticket #23's whole
+    point: segmentation is a code decision now, not a model one.
+
+    Window rows merge into one span while they stay the same app, either
+    across the ordinary small gap between polls (`WINDOW_MERGE_TOLERANCE`)
+    or across a larger gap with no real `idle: active` evidence in it
+    (`_idle_covers_away`) -- the real `2026-08-17 01:55–07:58` stretch this
+    rule was built against is 24 short same-app pings through a
+    `Maintenance Sleep`/`DarkWake` cycle, ~16 minutes apart, with no idle
+    data at all for most of the gaps between them (the Collector doesn't
+    run while the machine is actually asleep). A span that was ever bridged
+    the second way
+    becomes kind `away` rather than `window` when it closes: real time
+    within it was spent away from the desk, so it must not render with an
+    app label claiming otherwise. A different app, or a gap not fully
+    covered by away, always closes the current span instead of bridging.
+
+    A chunk with no window rows at all but real `idle: away` data (the
+    person never touched anything the whole chunk) still becomes one away
+    span spanning that data, rather than vanishing silently."""
+    window_rows = sorted((row for row in rows if row.kind == KIND_WINDOW), key=lambda row: row.at)
+    idle_rows = [row for row in rows if row.kind == KIND_IDLE]
+
+    if not window_rows:
+        away_rows = [row for row in idle_rows if row.away]
+        if not away_rows:
+            return []
+        start = min(row.at for row in away_rows)
+        end = max(row.confirmed_until for row in away_rows)
+        return [Span(kind=SPAN_KIND_AWAY, start=start, end=end, apps=(), rows=away_rows)]
+
+    spans: list[Span] = []
+    current_app: str | None = None
+    current_start: datetime | None = None
+    current_end: datetime | None = None
+    current_rows: list[Row] = []
+    current_touched_away = False
+
+    def flush() -> None:
+        if current_start is None:
+            return
+        kind = SPAN_KIND_AWAY if current_touched_away else SPAN_KIND_WINDOW
+        apps = () if kind == SPAN_KIND_AWAY else (current_app,)
+        spans.append(
+            Span(kind=kind, start=current_start, end=current_end, apps=apps, rows=list(current_rows))
+        )
+
+    for row in window_rows:
+        app = row.app or "?"
+        if current_app == app and current_end is not None:
+            gap = row.at - current_end
+            if gap <= WINDOW_MERGE_TOLERANCE:
+                current_end = max(current_end, row.confirmed_until)
+                current_rows.append(row)
+                continue
+            if _idle_covers_away(idle_rows, current_end, row.at):
+                current_end = max(current_end, row.confirmed_until)
+                current_rows.append(row)
+                current_touched_away = True
+                continue
+        flush()
+        current_app = app
+        current_start = row.at
+        current_end = row.confirmed_until
+        current_rows = [row]
+        current_touched_away = False
+
+    flush()
+    return spans
+
+
+def _format_span_range(span: Span) -> str:
+    return f"{span.start.astimezone():%H:%M}–{span.end.astimezone():%H:%M}"
+
+
+def _away_summary(span: Span) -> str:
+    """Deterministic, no provider call -- there is nothing to summarize by
+    construction (an away span is, by `build_spans`'s own rule, a stretch
+    with no real engagement to describe)."""
+    minutes = (span.end - span.start).total_seconds() / 60
+    return f"Away from the computer ({minutes:.0f}m)."
 
 
 def pending_days(
@@ -258,6 +417,42 @@ def _chunks_or_error(
     return chunks, None
 
 
+def _entries_for_chunk(
+    chunk: Chunk, day: date, provider
+) -> tuple[list[TimelineEntry], str | None]:
+    """One chunk's `TimelineEntry`s, in chronological order: away spans
+    render directly (`_away_summary`, no provider call -- nothing happened
+    to summarize), window spans get exactly one provider call for the whole
+    chunk, one summary per span (tickets #23/#24, `ADR-0007`'s "one call per
+    chunk" preserved -- a chunk can produce several entries from one call).
+
+    A chunk with no window spans at all (a fully away chunk) makes no
+    provider call whatsoever -- a real cost saving the redesign gets for
+    free, not just a scope-shrinking one.
+    """
+    spans = build_spans(chunk.rows)
+    window_spans = [span for span in spans if span.kind == SPAN_KIND_WINDOW]
+    away_spans = [span for span in spans if span.kind == SPAN_KIND_AWAY]
+
+    dated: list[tuple[datetime, TimelineEntry]] = [
+        (span.start, TimelineEntry(time_range=_format_span_range(span), summary=_away_summary(span)))
+        for span in away_spans
+    ]
+
+    if window_spans:
+        span_texts = [format_day_for_prompt(span.rows) for span in window_spans]
+        result = provider.summarize(day, span_texts, window_start=chunk.start, window_end=chunk.end)
+        if result.state != DaySummaryState.COMPLETED:
+            return [], result.error_message
+        for span, summary in zip(window_spans, result.summaries, strict=True):
+            dated.append(
+                (span.start, TimelineEntry(time_range=_format_span_range(span), summary=summary, apps=span.apps))
+            )
+
+    dated.sort(key=lambda pair: pair[0])
+    return [entry for _start, entry in dated], None
+
+
 def _process_day(
     day: date,
     day_rows: list[Row],
@@ -299,12 +494,10 @@ def _process_day(
 
     entries: list[TimelineEntry] = []
     for chunk in chunks:
-        result = provider.summarize(
-            day, chunk.text, window_start=chunk.start, window_end=chunk.end
-        )
-        if result.state != DaySummaryState.COMPLETED:
-            return SummarizeOutcome(day=day, written=False, error=result.error_message)
-        entries.extend(result.entries)
+        chunk_entries, chunk_error = _entries_for_chunk(chunk, day, provider)
+        if chunk_error is not None:
+            return SummarizeOutcome(day=day, written=False, error=chunk_error)
+        entries.extend(chunk_entries)
 
     markdown = render_daily_memory(day, tuple(entries))
     start_local, end_local = _local_day_bounds(day)
