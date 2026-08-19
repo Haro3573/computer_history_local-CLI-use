@@ -135,7 +135,7 @@ def status(*, store_path: Path | str = DEFAULT_STORE, now: datetime | None = Non
         f"plist: {plist_path()} ({'exists' if plist_path().exists() else 'missing'})",
     ]
     with Store(store_path) as store:
-        for kind in ("window", "idle", "browser"):
+        for kind in ("window", "idle", "browser", "system"):
             last = store.last_row(kind)
             if last is None:
                 lines.append(f"{kind}: no rows yet")

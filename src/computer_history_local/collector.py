@@ -79,6 +79,17 @@ def run_forever(
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
     sample_fn: Callable[[], Sample] = default_sample,
 ) -> None:
+    from .power_log import ingest_power_events
+
+    # Sleep/wake is read back from the machine's own log, not sampled, so it
+    # doesn't belong in every 30-second poll -- pmset reprints its entire
+    # history on every call. Ten minutes (`adhd_lifelog`'s own cadence,
+    # ticket #26) is far below the gaps this is meant to label.
+    power_every = max(1, round(600 / interval_seconds))
+    polls = 0
     while True:
         run_once(store, sample_fn=sample_fn)
+        if polls % power_every == 0:
+            ingest_power_events(store)
+        polls += 1
         time.sleep(interval_seconds)

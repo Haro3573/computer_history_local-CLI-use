@@ -23,6 +23,10 @@ from pathlib import Path
 KIND_WINDOW = "window"
 KIND_IDLE = "idle"
 KIND_BROWSER = "browser"
+# Ticket #26: read back from `pmset -g log` rather than polled -- `app`
+# carries the pmset entry type (`sleep`/`wake`/`darkwake`), `title` the
+# reason string verbatim. See `power_log.py`.
+KIND_SYSTEM = "system"
 
 DEFAULT_STORE = Path("~/.local/share/computer-history-local/state.sqlite3")
 DEFAULT_PULSETIME = timedelta(minutes=5)
