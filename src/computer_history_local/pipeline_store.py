@@ -181,3 +181,10 @@ class PipelineStore:
             (date,),
         )
         return [_memory_index_row_from_sqlite(row) for row in cursor.fetchall()]
+
+    def all_dates(self) -> list[str]:
+        """Every distinct date with at least one `Daily memory` -- ticket
+        #29's `ask` needs this to gather every existing day; nothing before
+        it did."""
+        cursor = self._connection.execute("SELECT DISTINCT date FROM memory_index ORDER BY date ASC")
+        return [row["date"] for row in cursor.fetchall()]

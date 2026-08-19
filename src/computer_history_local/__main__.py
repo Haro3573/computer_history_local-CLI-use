@@ -30,15 +30,16 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from .collector import DEFAULT_INTERVAL_SECONDS, run_forever
 from .launch_agent import install, status, uninstall
 from .memory_pipeline import DEFAULT_MEMORY_DIR, preview, summarize_once
 from .pipeline_store import PipelineStore
-from .providers.claude_cli import ClaudeCliProvider
+from .providers.claude_cli import ClaudeCliProvider, DaySummaryState
 from .providers.fake import FakeProvider
+from .retrieval import ask_preview, gather_all_daily_memories, lookup
 from .store import DEFAULT_STORE, Store
 
 
@@ -72,6 +73,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Force-reprocess exactly this day, even if already covered -- never
     # touches the Watermark either way (ticket #16).
     summarize_parser.add_argument("--reprocess", type=date.fromisoformat, default=None)
+
+    # Ticket #28: free, deterministic. One date is a single-day lookup, two
+    # is an inclusive range -- the same date-parsing shape `--reprocess`
+    # already established, not new flag syntax for the same kind of input.
+    retrieve_parser = subparsers.add_parser(
+        "retrieve", help="Print a Daily memory file, or a range of them"
+    )
+    retrieve_parser.add_argument("--store", type=Path, default=None)
+    retrieve_parser.add_argument("start", type=date.fromisoformat)
+    retrieve_parser.add_argument("end", type=date.fromisoformat, nargs="?", default=None)
+
+    # Ticket #29: costs a real call once --send is passed. Off by default --
+    # the same consent shape as `summarize --send`, but its own independent
+    # gate (CONTEXT.md's Capture-vs-Transfer rule: never the same decision).
+    ask_parser = subparsers.add_parser(
+        "ask", help="Ask a free-text question across every Daily memory file"
+    )
+    ask_parser.add_argument("--store", type=Path, default=None)
+    ask_parser.add_argument("question")
+    ask_parser.add_argument("--provider", choices=("fake", "claude-cli"), default="fake")
+    ask_parser.add_argument("--send", action="store_true")
 
     return parser.parse_args(argv)
 
@@ -164,6 +186,62 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"skipped {outcome.day.isoformat()}: {outcome.skipped_reason}")
             else:
                 print(f"failed {outcome.day.isoformat()}: {outcome.error}")
+        return
+
+    if args.command == "retrieve":
+        store_path = args.store if args.store is not None else DEFAULT_STORE
+        try:
+            with PipelineStore(store_path) as pipeline_store:
+                result = lookup(pipeline_store, args.start, args.end)
+        except sqlite3.OperationalError as exc:
+            print(f"failed to open the store: {exc}")
+            sys.exit(1)
+        if not result.dates:
+            missing = ", ".join(d.isoformat() for d in result.missing)
+            print(f"no Daily memory for: {missing}")
+            sys.exit(1)
+        print(result.text)
+        if result.missing:
+            missing = ", ".join(d.isoformat() for d in result.missing)
+            print(f"\n(no Daily memory for: {missing})")
+        return
+
+    if args.command == "ask":
+        store_path = args.store if args.store is not None else DEFAULT_STORE
+        try:
+            with PipelineStore(store_path) as pipeline_store:
+                if not args.send:
+                    # Free, no-network preview -- no provider call, same
+                    # shape as `summarize`'s own preview (ticket #17).
+                    ask_preview_result = ask_preview(pipeline_store)
+                    if not ask_preview_result.dates:
+                        print("no Daily memory exists yet")
+                        sys.exit(1)
+                    print(
+                        f"{len(ask_preview_result.dates)} day(s), "
+                        f"{ask_preview_result.total_chars} chars total:"
+                    )
+                    for day in ask_preview_result.dates:
+                        print(f"  {day.isoformat()}")
+                    print()
+                    print("pass --send to call the provider and get an answer")
+                    return
+                day_contents = gather_all_daily_memories(pipeline_store)
+        except sqlite3.OperationalError as exc:
+            print(f"failed to open the store: {exc}")
+            sys.exit(1)
+        if not day_contents:
+            print("no Daily memory exists yet")
+            sys.exit(1)
+        provider = FakeProvider() if args.provider == "fake" else ClaudeCliProvider()
+        today = datetime.now(UTC).astimezone().date()
+        result = provider.answer(args.question, day_contents, today=today)
+        if result.state != DaySummaryState.COMPLETED:
+            print(f"failed: {result.error_message}")
+            sys.exit(1)
+        print(result.answer)
+        if result.cited_dates:
+            print("\ncited: " + ", ".join(result.cited_dates))
         return
 
     # args.command == "run"

@@ -217,6 +217,35 @@ def _parse_summaries(parsed: dict[str, Any]) -> list[str] | None:
     return raw_summaries
 
 
+@dataclass(frozen=True)
+class AnswerResult:
+    """One free-text answer to an `ask` question (ticket #29), covering
+    every existing `Daily memory` file. `cited_dates` may legitimately be
+    empty -- a truthful "not found in what's recorded" answer cites
+    nothing -- but `answer` itself is never blank (`_parse_answer`
+    rejects that)."""
+
+    state: DaySummaryState
+    answer: str = ""
+    cited_dates: tuple[str, ...] = ()
+    error_message: str | None = None
+
+
+def _parse_answer(parsed: dict[str, Any]) -> tuple[str, list[str]] | None:
+    """Manual validation, same reasoning as `_parse_summaries`. `cited_dates`
+    may be an empty list (a truthful "I don't see this recorded" has
+    nothing to cite) but must still be present and shaped correctly --
+    ticket #29's traceability requirement is about *loud* omission, not
+    forcing a citation onto an answer that shouldn't have one."""
+    answer = parsed.get("answer")
+    cited_dates = parsed.get("cited_dates")
+    if not isinstance(answer, str) or not answer.strip():
+        return None
+    if not isinstance(cited_dates, list) or not all(isinstance(d, str) for d in cited_dates):
+        return None
+    return answer, cited_dates
+
+
 @dataclass
 class ClaudeCliProvider:
     """Summarizes one chunk's already-decided spans per call via a
@@ -256,36 +285,38 @@ class ClaudeCliProvider:
             f"{numbered_spans}\n"
         )
 
-    def summarize(
-        self, day: date, span_texts: list[str], *, window_start: datetime, window_end: datetime
-    ) -> DaySummaryResult:
-        def failure(state: DaySummaryState, message: str) -> DaySummaryResult:
-            return DaySummaryResult(state=state, error_message=message)
-
+    def _invoke_and_parse(
+        self, prompt: str
+    ) -> tuple[dict[str, Any], None] | tuple[None, tuple[DaySummaryState, str]]:
+        """Everything `summarize()` and `answer()` share: resolve the CLI,
+        run it, and get back a parsed JSON object or a specific failure --
+        the two callers only ever differ in what shape they expect *inside*
+        that object. Factored out (ticket #29) rather than duplicated,
+        since `answer()` needed the exact same subprocess mechanics as
+        `summarize()` already had, already tested."""
         resolved = _resolve_executable(self.config.executable)
         if resolved is None:
-            return failure(
+            return None, (
                 DaySummaryState.PROVIDER_ERROR,
                 f"{self.config.executable} is not on PATH.",
             )
 
-        prompt = self.build_prompt(day, span_texts, window_start=window_start, window_end=window_end)
         command = self.config.command_for(prompt)
         command[0] = resolved
         try:
             invocation = self.runner(command, timeout=self.config.timeout_seconds)
         except subprocess.TimeoutExpired:
-            return failure(
+            return None, (
                 DaySummaryState.TIMEOUT,
                 f"{self.config.executable} did not finish within "
                 f"{self.config.timeout_seconds:g}s.",
             )
         except OSError as exc:
-            return failure(DaySummaryState.PROVIDER_ERROR, str(exc))
+            return None, (DaySummaryState.PROVIDER_ERROR, str(exc))
 
         if invocation.returncode != 0:
             detail = (invocation.stderr or invocation.stdout or "").strip()
-            return failure(
+            return None, (
                 DaySummaryState.PROVIDER_ERROR,
                 f"{self.config.executable} exited {invocation.returncode}: "
                 + (detail[:400] or "no output"),
@@ -294,26 +325,36 @@ class ClaudeCliProvider:
         envelope = extract_json_object(invocation.stdout)
         if isinstance(envelope, dict) and envelope.get("is_error"):
             detail = envelope.get("result")
-            return failure(
+            return None, (
                 DaySummaryState.PROVIDER_ERROR,
                 f"{self.config.executable} reported an error: "
                 + (str(detail)[:400] if detail else "no detail"),
             )
 
-        answer = unwrap_cli_envelope(invocation.stdout)
-        parsed = extract_json_object(answer)
+        answer_text = unwrap_cli_envelope(invocation.stdout)
+        parsed = extract_json_object(answer_text)
         if parsed is None:
-            return failure(
+            return None, (
                 DaySummaryState.SCHEMA_ERROR,
                 "no JSON object found in the CLI output. First 400 "
                 "characters: " + invocation.stdout.strip()[:400],
             )
+        return parsed, None
+
+    def summarize(
+        self, day: date, span_texts: list[str], *, window_start: datetime, window_end: datetime
+    ) -> DaySummaryResult:
+        prompt = self.build_prompt(day, span_texts, window_start=window_start, window_end=window_end)
+        parsed, error = self._invoke_and_parse(prompt)
+        if error is not None:
+            state, message = error
+            return DaySummaryResult(state=state, error_message=message)
 
         summaries = _parse_summaries(parsed)
         if summaries is None:
-            return failure(
-                DaySummaryState.SCHEMA_ERROR,
-                "CLI output did not match the {summaries: [\"...\"]} shape.",
+            return DaySummaryResult(
+                state=DaySummaryState.SCHEMA_ERROR,
+                error_message="CLI output did not match the {summaries: [\"...\"]} shape.",
             )
 
         # `_process_day` zips these positionally against the spans that
@@ -322,9 +363,59 @@ class ClaudeCliProvider:
         # constraint on this ticket). Caught here, loud, before it reaches
         # that zip.
         if len(summaries) != len(span_texts):
-            return failure(
-                DaySummaryState.SCHEMA_ERROR,
-                f"expected {len(span_texts)} summaries (one per span), got {len(summaries)}.",
+            return DaySummaryResult(
+                state=DaySummaryState.SCHEMA_ERROR,
+                error_message=(
+                    f"expected {len(span_texts)} summaries (one per span), got {len(summaries)}."
+                ),
             )
 
         return DaySummaryResult(state=DaySummaryState.COMPLETED, summaries=tuple(summaries))
+
+    def build_answer_prompt(
+        self, question: str, day_contents: list[tuple[date, str]], *, today: date
+    ) -> str:
+        # States today's real date explicitly, the same reason
+        # `build_prompt` states the actual window: resolving a relative
+        # phrase ("last week", "when I fixed that bug") needs a stated
+        # calendar anchor, not just the Daily memory entries' own dates
+        # (ticket #29).
+        daily_memories = "\n\n".join(content for _day, content in day_contents)
+        return (
+            "You have no tools. Do not attempt to read files, run commands, "
+            "or search. Everything you need is in the data below.\n\n"
+            f"Today's date is {today.isoformat()}. Answer the question below "
+            "using only the Daily memory entries provided -- each entry "
+            "starts with its own '# YYYY-MM-DD' date heading. Resolve "
+            "relative time phrases against today's date and the entries' "
+            "own dates. If the answer isn't supported by the data below, "
+            "say so plainly rather than guessing.\n\n"
+            "Answer with a single JSON object and nothing else. No prose, "
+            "no markdown fence, no explanation. Shape:\n"
+            '{"answer": "...", "cited_dates": ["YYYY-MM-DD", ...]}\n\n'
+            f"Question: {question}\n\n"
+            f"Data:\n{daily_memories}\n"
+        )
+
+    def answer(
+        self, question: str, day_contents: list[tuple[date, str]], *, today: date
+    ) -> AnswerResult:
+        prompt = self.build_answer_prompt(question, day_contents, today=today)
+        parsed, error = self._invoke_and_parse(prompt)
+        if error is not None:
+            state, message = error
+            return AnswerResult(state=state, error_message=message)
+
+        parsed_answer = _parse_answer(parsed)
+        if parsed_answer is None:
+            return AnswerResult(
+                state=DaySummaryState.SCHEMA_ERROR,
+                error_message=(
+                    'CLI output did not match the {answer: "...", '
+                    'cited_dates: ["..."]} shape.'
+                ),
+            )
+        text, cited_dates = parsed_answer
+        return AnswerResult(
+            state=DaySummaryState.COMPLETED, answer=text, cited_dates=tuple(cited_dates)
+        )
