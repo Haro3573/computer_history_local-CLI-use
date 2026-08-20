@@ -9,6 +9,106 @@ See [CONTEXT.md](CONTEXT.md) for the domain glossary and architecture,
 [docs/adr/](docs/adr/) for why specific decisions were made, and
 [docs/later.md](docs/later.md) for ideas considered and deferred.
 
+## How it works
+
+Three views of the same system, at three zoom levels: what a person does at
+the terminal, which modules that triggers, and what happens to one piece of
+activity data from the moment it's polled to the moment it's read back.
+
+Teal is the one color code that repeats across all three diagrams below —
+**stays on this Mac**. Amber is the opposite — **leaves this Mac**, and only
+ever happens where `--send` appears explicitly.
+
+### User flow
+
+```mermaid
+flowchart TD
+    Install(["install"]) --> Collector[["Collector — runs continuously<br/>30s poll + sleep/wake log"]]:::local
+    Collector -.-> Summarize["summarize"]
+    Collector -.-> Retrieve["retrieve date"]
+    Collector -.-> Ask["ask (free-text question)"]
+    Uninstall(["uninstall"]) -. stops .-> Collector
+
+    Summarize --> SPreview["no --send: preview only"]
+    SPreview -->|"--provider X --send"| SSend["Provider call — leaves this Mac"]:::transfer
+    SSend --> SDone["Daily memory file written"]
+
+    Retrieve --> RDone["always free — local files only"]
+
+    Ask --> APreview["no --send: preview only"]
+    APreview -->|"--provider X --send"| ASend["Provider call — leaves this Mac"]:::transfer
+    ASend --> ADone["Answer + cited dates"]
+
+    classDef local fill:#e4efec,stroke:#0f6b63,color:#0f6b63,stroke-width:1.5px;
+    classDef transfer fill:#f5e7d8,stroke:#a85419,color:#a85419,stroke-width:1.5px,stroke-dasharray: 4 3;
+```
+
+One `install` starts the Collector running unattended. Everything else runs
+whenever you like. Both consent gates are the same shape: no default
+provider, so `--send` without an explicit `--provider` refuses outright
+rather than guessing (`ADR-0008`). `uninstall` only ever touches the
+LaunchAgent — captured data and generated memories are never deleted by it.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    subgraph Mac["This Mac"]
+        direction TB
+        Collector["Collector<br/>window / idle / browser / sleep-wake<br/>polls every 30s"]
+        Store["Store<br/>state_samples table<br/>Pulsetime merge, 5 min"]
+        Pipeline["Memory Pipeline<br/>build_spans → day_chunks<br/>Watermark-gated (ADR-0005)"]
+        Files["Daily memory + index<br/>memories/*.md · memory_index"]
+        Retrieval["Retrieval<br/>lookup() · ask_once()"]
+        CLI["__main__.py<br/>your terminal"]
+
+        Collector -->|redact + write| Store
+        Store -->|pending days| Pipeline
+        Pipeline -->|write, advance Watermark| Files
+        Files -->|read| Retrieval
+        Retrieval -->|print| CLI
+    end
+
+    Cloud(["Claude<br/>cloud, via local `claude` CLI"]):::transfer
+    Pipeline -->|"chunk (--send)"| Cloud
+    Cloud -->|summaries| Pipeline
+    Retrieval -->|"days (ask --send)"| Cloud
+    Cloud -->|answer| Retrieval
+
+    classDef transfer fill:#f5e7d8,stroke:#a85419,color:#a85419,stroke-width:1.5px,stroke-dasharray: 4 3;
+```
+
+Five modules in a straight line, all local, plus one seam that reaches off
+the machine. `FakeProvider` and `ClaudeCliProvider` sit behind that one seam
+(`providers.provider_for`) — the diagram's dashed amber edges are the only
+two places in the whole system a network call can occur, and both only fire
+when `--send` is passed with an explicit provider.
+
+### Data lifecycle
+
+```mermaid
+flowchart LR
+    Raw["Raw signal<br/>app / window / URL, idle, pmset log"]
+    Redacted["Redacted<br/>secret patterns + URL sanitize"]
+    Sample["State sample<br/>Pulsetime-merged, stored indefinitely"]
+    Batched["Batched + chunked<br/>one calendar day, ≤4,000 chars"]
+    Provider["Provider call<br/>leaves this Mac"]:::transfer
+    Entry["Timeline entry<br/>time range → summary → apps"]
+    File["Daily memory file<br/>+ memory_index row"]
+    Read["Read later — free<br/>retrieve · ask"]
+
+    Raw --> Redacted --> Sample --> Batched --> Provider --> Entry --> File --> Read
+
+    classDef transfer fill:#f5e7d8,stroke:#a85419,color:#a85419,stroke-width:1.5px,stroke-dasharray: 4 3;
+```
+
+One poll of the frontmost window, followed from raw signal to something you
+can ask a question about. Redaction happens before the first write
+(`ADR-0006`). A `State sample` can then sit in local storage indefinitely —
+Capture has no consent gate (`ADR-0004`). The Provider call is the one stage
+that isn't local, and it's the only stage gated by consent. The `Watermark`
+only advances once that write has actually succeeded (`ADR-0005`).
+
 ## Requirements
 
 - macOS
