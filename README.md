@@ -109,6 +109,39 @@ Capture has no consent gate (`ADR-0004`). The Provider call is the one stage
 that isn't local, and it's the only stage gated by consent. The `Watermark`
 only advances once that write has actually succeeded (`ADR-0005`).
 
+## What this collects
+
+Four channels, all written to one local `state.sqlite3`, nothing else:
+
+- **Frontmost app + window title** — polled every 30s via `osascript`. The
+  window title needs Accessibility permission; without it, only the app
+  name is captured. Passed through a redactor before it's ever written —
+  API keys, bearer tokens, AWS access keys, and generic `key=value` secret
+  assignments become `[REDACTED:...]` markers, since a terminal's window
+  title is often its own command line.
+- **Idle / away** — a boolean only, read from macOS's own idle timer:
+  away past 3 minutes of no input, active otherwise. The precise idle
+  duration itself is never stored, just whether the threshold was crossed.
+- **Browser URL** — Chrome, Safari, Arc, and Brave only, the front tab of
+  whichever is frontmost. Reduced to origin + path before it's ever
+  written — no query string, fragment, or embedded credentials ever reach
+  storage, since that's exactly where session tokens and search terms
+  live. Passed through the same redactor as window titles.
+- **Sleep / wake** — read back after the fact from `pmset -g log` (macOS's
+  own system log, no new permission needed), checked every 10 minutes, so
+  a gap in the other channels can be labeled "machine was asleep" rather
+  than "person walked away" or "Collector died."
+
+**Never captured, at any point**: keystrokes, clicks, typed content, or
+screen/screenshot content. The Collector records that something changed,
+never what was typed or shown — see `ADR-0001` for why capture stops at
+that line.
+
+Everything above stays on this Mac (`Capture` has no consent gate,
+`ADR-0004`) until `summarize --send` or `ask --send` sends it to a cloud
+model — the only two commands that ever leave the machine, and both refuse
+to run without an explicit `--provider` (`ADR-0008`).
+
 ## Requirements
 
 - macOS
