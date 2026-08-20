@@ -49,9 +49,13 @@ lives under `~/.local/share/computer-history-local/` — `state.sqlite3`
 manually triggered — nothing does this automatically yet):
 
 ```bash
-python -m computer_history_local summarize            # free preview, no network call
-python -m computer_history_local summarize --send      # spends real Claude usage, writes files
+python -m computer_history_local summarize                                   # free preview, no network call
+python -m computer_history_local summarize --provider claude-cli --send      # spends real Claude usage, writes files
 ```
+
+`--provider` has no default (`ADR-0008`) — it's required with `--send`, but
+never read on a plain preview run above. `fake` is a network-free stand-in
+provider for testing the wiring, not something you want against real data.
 
 **Look up a day, or a range, for free** (`Retrieval`'s deterministic half —
 no network call, no cost):
@@ -65,8 +69,8 @@ python -m computer_history_local retrieve 2026-08-15 2026-08-17
 (`Retrieval`'s paid half — reads every `Daily memory` file that exists):
 
 ```bash
-python -m computer_history_local ask "what was I doing last week"              # free preview: which days, how many chars
-python -m computer_history_local ask "what was I doing last week" --send        # spends real Claude usage, answers
+python -m computer_history_local ask "what was I doing last week"                                       # free preview: which days, how many chars
+python -m computer_history_local ask "what was I doing last week" --provider claude-cli --send            # spends real Claude usage, answers
 ```
 
 `--send` is the only thing that ever sends anything off this Mac — every
