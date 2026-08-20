@@ -6,6 +6,7 @@
     python -m computer_history_local status [--store PATH]
     python -m computer_history_local summarize [--store PATH] [--memory-dir PATH]
         [--provider {fake,claude-cli}] [--send] [--reprocess YYYY-MM-DD]
+    python -m computer_history_local process-sessions [--store PATH] [--sessions-dir PATH]
 
 `run` is what the LaunchAgent plist itself invokes
 (`launch_agent.build_plist`'s `ProgramArguments`) -- an explicit subcommand,
@@ -39,6 +40,8 @@ from .memory_pipeline import DEFAULT_MEMORY_DIR, preview, summarize_once
 from .pipeline_store import PipelineStore
 from .providers import PROVIDER_CHOICES, provider_for
 from .retrieval import MemoryFileMissingError, ask_once, ask_preview, lookup
+from .session_pipeline import DEFAULT_SESSIONS_DIR, process_sessions_once
+from .session_store import SessionStore
 from .store import DEFAULT_STORE, Store
 
 
@@ -76,6 +79,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Force-reprocess exactly this day, even if already covered -- never
     # touches the Watermark either way (ticket #16).
     summarize_parser.add_argument("--reprocess", type=date.fromisoformat, default=None)
+
+    # Ticket #30: no --provider, no --send -- reading AI session files off
+    # disk and reducing them has no consent gate (ADR-0009) and never
+    # leaves the machine either way.
+    process_sessions_parser = subparsers.add_parser(
+        "process-sessions", help="Fold new AI session turns into sessions/*.md files"
+    )
+    process_sessions_parser.add_argument("--store", type=Path, default=None)
+    process_sessions_parser.add_argument("--sessions-dir", type=Path, default=None)
 
     # Ticket #28: free, deterministic. One date is a single-day lookup, two
     # is an inclusive range -- the same date-parsing shape `--reprocess`
@@ -203,11 +215,30 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"failed {outcome.day.isoformat()}: {outcome.error}")
         return
 
+    if args.command == "process-sessions":
+        store_path = args.store if args.store is not None else DEFAULT_STORE
+        sessions_dir = args.sessions_dir if args.sessions_dir is not None else DEFAULT_SESSIONS_DIR
+        try:
+            with SessionStore(store_path) as session_store:
+                result = process_sessions_once(session_store, sessions_dir=sessions_dir)
+        except sqlite3.OperationalError as exc:
+            print(f"failed to open the store: {exc}")
+            sys.exit(1)
+        print(
+            f"{result.files_processed} file(s) processed, "
+            f"{result.files_skipped_live} live session(s) skipped, "
+            f"{result.new_turn_count} new turn(s)"
+        )
+        print("days updated: " + ", ".join(result.days_written) if result.days_written else "nothing new")
+        for error in result.errors:
+            print(f"error: {error}")
+        return
+
     if args.command == "retrieve":
         store_path = args.store if args.store is not None else DEFAULT_STORE
         try:
-            with PipelineStore(store_path) as pipeline_store:
-                result = lookup(pipeline_store, args.start, args.end)
+            with PipelineStore(store_path) as pipeline_store, SessionStore(store_path) as session_store:
+                result = lookup(pipeline_store, args.start, args.end, session_store=session_store)
         except sqlite3.OperationalError as exc:
             print(f"failed to open the store: {exc}")
             sys.exit(1)
@@ -222,16 +253,18 @@ def main(argv: list[str] | None = None) -> None:
         if result.missing:
             missing = ", ".join(d.isoformat() for d in result.missing)
             print(f"\n(no Daily memory for: {missing})")
+        if result.live_session_excluded:
+            print("\n(current session omitted -- already in your context)")
         return
 
     if args.command == "ask":
         store_path = args.store if args.store is not None else DEFAULT_STORE
         if not args.send:
             try:
-                with PipelineStore(store_path) as pipeline_store:
+                with PipelineStore(store_path) as pipeline_store, SessionStore(store_path) as session_store:
                     # Free, no-network preview -- no provider call, same
                     # shape as `summarize`'s own preview (ticket #17).
-                    ask_preview_result = ask_preview(pipeline_store)
+                    ask_preview_result = ask_preview(pipeline_store, session_store)
             except sqlite3.OperationalError as exc:
                 print(f"failed to open the store: {exc}")
                 sys.exit(1)
@@ -247,14 +280,16 @@ def main(argv: list[str] | None = None) -> None:
             )
             for day in ask_preview_result.dates:
                 print(f"  {day.isoformat()}")
+            if ask_preview_result.live_session_excluded:
+                print("\n(current session omitted -- already in your context)")
             print()
             print("pass --send to call the provider and get an answer")
             return
 
         provider = _provider_or_exit(args.provider)
         try:
-            with PipelineStore(store_path) as pipeline_store:
-                result = ask_once(pipeline_store, provider, args.question)
+            with PipelineStore(store_path) as pipeline_store, SessionStore(store_path) as session_store:
+                result = ask_once(pipeline_store, provider, args.question, session_store=session_store)
         except sqlite3.OperationalError as exc:
             print(f"failed to open the store: {exc}")
             sys.exit(1)
@@ -267,6 +302,8 @@ def main(argv: list[str] | None = None) -> None:
         print(result.answer)
         if result.cited_dates:
             print("\ncited: " + ", ".join(result.cited_dates))
+        if result.live_session_excluded:
+            print("\n(current session omitted -- already in your context)")
         return
 
     # args.command == "run"
