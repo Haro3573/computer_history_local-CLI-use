@@ -136,7 +136,7 @@ where you pasted a real credential into a Claude Code or Codex session.
 
 ## What this collects
 
-Four channels, all written to one local `state.sqlite3`, nothing else:
+Four channels, all written to one local `state.sqlite3`:
 
 - **Frontmost app + window title** — polled every 30s via `osascript`. The
   window title needs Accessibility permission; without it, only the app
@@ -176,7 +176,15 @@ A fifth source works differently and sits outside the Collector entirely:
   (`ADR-0010`) — read that ADR before running `ask --send` over a day
   where you pasted a real credential into a session. The one session still
   open right now is always excluded, since it's already in the calling
-  agent's own context (`CONTEXT.md`'s `Live session` entry).
+  agent's own context (`CONTEXT.md`'s `Live session` entry). Unlike the
+  four channels above, this one *does* persist more than its final output:
+  `process-sessions` caches a reduced copy per day into `sessions/*.md`,
+  but also keeps the underlying turns it was reduced from in this
+  project's own `state.sqlite3` (`session_slices.raw_turns`), so a
+  resumed conversation can be re-reduced correctly next run instead of
+  needing a full re-read of the original file. That's a real, deliberate
+  copy of your own AI conversation history sitting in local SQLite, not
+  just a live pass-through — a design tradeoff, not an oversight.
 
 Everything above stays on this Mac (`Capture` has no consent gate,
 `ADR-0004`; AI session reading has no consent gate either, `ADR-0009`)
@@ -194,6 +202,11 @@ without an explicit `--provider` (`ADR-0008`).
   same reasoning `adhd_lifelog` uses. Nothing else needs a network call or
   a new permission: `pmset` (sleep/wake) and window/idle capture are both
   built into macOS.
+- Optional: having actually used [Claude Code](https://claude.com/claude-code)
+  and/or [Codex](https://developers.openai.com/codex) on this Mac, if you
+  want `process-sessions`/`retrieve`/`ask` to include AI session history.
+  Neither is a hard dependency — `process-sessions` just finds nothing to
+  read if you've used neither.
 
 ## Install
 
@@ -281,7 +294,10 @@ python -m computer_history_local uninstall
 ```
 
 Stops and removes the Collector's LaunchAgent. Captured data and generated
-memories under `~/.local/share/computer-history-local/` are left in place.
+memories under `~/.local/share/computer-history-local/` are left in place —
+`state.sqlite3`, `memories/*.md`, and `sessions/*.md` alike. `uninstall`
+only ever touches the LaunchAgent; `process-sessions` still works fine
+afterward, since it never depended on the Collector running.
 
 ## Agent integration
 
