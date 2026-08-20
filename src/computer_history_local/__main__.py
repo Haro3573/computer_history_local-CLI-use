@@ -80,7 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # touches the Watermark either way (ticket #16).
     summarize_parser.add_argument("--reprocess", type=date.fromisoformat, default=None)
 
-    # Ticket #30: no --provider, no --send -- reading AI session files off
+    # Ticket #31: no --provider, no --send -- reading AI session files off
     # disk and reducing them has no consent gate (ADR-0009) and never
     # leaves the machine either way.
     process_sessions_parser = subparsers.add_parser(

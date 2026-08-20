@@ -1,5 +1,5 @@
 """`Session cursor`, `Session slice`, and `sessions/*.md` index persistence
--- ticket #30's storage layer, mirroring `pipeline_store.py`'s shape for the
+-- ticket #31's storage layer, mirroring `pipeline_store.py`'s shape for the
 same reasons: append-only where possible (`tests/test_store.py`'s
 `test_only_update_statement_in_package_touches_duration` enforces that the
 only `UPDATE` anywhere in this package touches `duration`, so every write

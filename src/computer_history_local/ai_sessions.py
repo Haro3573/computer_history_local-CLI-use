@@ -1,4 +1,4 @@
-"""Discover, parse, and reduce `AI session` transcripts -- ticket #30.
+"""Discover, parse, and reduce `AI session` transcripts -- ticket #31.
 
 Reads Claude Code's and Codex's own local session files
 (`~/.claude/projects/**/*.jsonl`, `~/.codex/sessions/**/*.jsonl`) --

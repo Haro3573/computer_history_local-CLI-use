@@ -1,5 +1,5 @@
 """Wire `ai_sessions.py`'s discovery/parsing/reduction to `session_store.py`
--- ticket #30's `process-sessions` orchestration, mirroring
+-- ticket #31's `process-sessions` orchestration, mirroring
 `memory_pipeline.py`'s shape (batch, reduce, write, advance) for the same
 "kept thin, testable end-to-end with a fake source" reasoning.
 

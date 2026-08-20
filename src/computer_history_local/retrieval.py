@@ -154,7 +154,7 @@ class LookupResult:
     dropping it (`_find_overlap`'s own reasoning: silent failure is worse
     than a loud one). `live_session_excluded` is true only when today falls
     within the requested range and a `Live session` was actually found and
-    skipped -- ticket #30's Q11: singular, and only when it's actually
+    skipped -- ticket #31's Q11: singular, and only when it's actually
     true, never a standing notice."""
 
     dates: tuple[date, ...]
@@ -177,7 +177,7 @@ def lookup(
     the CLI layer decides whether that's an error (ticket #28: a single
     missing day just errors) or a partial range (shown with what's there).
 
-    `session_store` is optional and additive (ticket #30): omitted, this
+    `session_store` is optional and additive (ticket #31): omitted, this
     behaves exactly as it always has -- `Daily memory` only. Passed, each
     day's text gains a separate `## AI sessions` section when there's
     anything to add (`_combine`), and a day with session content but no
@@ -251,7 +251,7 @@ def gather_all_context(
     now: datetime | None = None,
     session_roots: tuple[tuple[Path, str], ...] = DEFAULT_SESSION_ROOTS,
 ) -> list[tuple[date, str]]:
-    """`gather_all_daily_memories`, plus (ticket #30, optional and additive
+    """`gather_all_daily_memories`, plus (ticket #31, optional and additive
     like `lookup`'s own `session_store` param) every day's `AI session`
     content folded in as its own section (`_combine`) -- including a day
     that has session content but no `Daily memory` at all, which today
