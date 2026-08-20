@@ -65,7 +65,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     summarize_parser.add_argument("--store", type=Path, default=None)
     summarize_parser.add_argument("--memory-dir", type=Path, default=None)
-    summarize_parser.add_argument("--provider", choices=("fake", "claude-cli"), default="fake")
+    # No default -- see ADR-0008. Only matters once --send is passed (the
+    # free preview path below never reads args.provider at all), so this
+    # stays optional in argparse's eyes; main() enforces it's set before
+    # a --send run ever reaches a provider.
+    summarize_parser.add_argument("--provider", choices=("fake", "claude-cli"), default=None)
     # Off by default -- Transfer's own consent gate (CONTEXT.md), the same
     # shape as `adhd_lifelog`'s `now --send`. Without it nothing is called
     # and nothing is written.
@@ -92,7 +96,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ask_parser.add_argument("--store", type=Path, default=None)
     ask_parser.add_argument("question")
-    ask_parser.add_argument("--provider", choices=("fake", "claude-cli"), default="fake")
+    # No default -- see ADR-0008, same reasoning as `summarize`'s --provider.
+    ask_parser.add_argument("--provider", choices=("fake", "claude-cli"), default=None)
     ask_parser.add_argument("--send", action="store_true")
 
     return parser.parse_args(argv)
@@ -153,6 +158,13 @@ def main(argv: list[str] | None = None) -> None:
             print()
             print("pass --send to call the provider and write memories")
             return
+        if args.provider is None:
+            # ADR-0008: no default provider once --send is in play -- a
+            # forgotten --provider used to silently resolve to `fake` and
+            # advance the Watermark past a day that was never really
+            # summarized.
+            print("--provider is required with --send (choices: fake, claude-cli)")
+            sys.exit(1)
         if args.reprocess is not None and args.provider == "fake":
             # --reprocess overwrites a real day's file+index (OR REPLACE)
             # and never touches the Watermark either way -- if that
@@ -208,6 +220,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "ask":
         store_path = args.store if args.store is not None else DEFAULT_STORE
+        if args.send and args.provider is None:
+            # ADR-0008, same reasoning as `summarize`'s own check.
+            print("--provider is required with --send (choices: fake, claude-cli)")
+            sys.exit(1)
         try:
             with PipelineStore(store_path) as pipeline_store:
                 if not args.send:
