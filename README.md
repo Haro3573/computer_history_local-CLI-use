@@ -185,6 +185,34 @@ python -m computer_history_local uninstall
 Stops and removes the Collector's LaunchAgent. Captured data and generated
 memories under `~/.local/share/computer-history-local/` are left in place.
 
+## Agent integration
+
+`skills/computer-history/` teaches an agent how to answer "what was I doing
+last week?" by calling this CLI, instead of guessing or fabricating an
+answer. Two files, one per tool, since Claude Code and Codex load
+instructions differently (Claude Code triggers a `SKILL.md` on demand;
+Codex always loads `AGENTS.md` for the whole session):
+
+**Claude Code** — install once so it's available in any project, not just
+this one:
+
+```bash
+mkdir -p ~/.claude/skills/computer-history
+cp skills/computer-history/SKILL.md ~/.claude/skills/computer-history/SKILL.md
+```
+
+**Codex** — append to the global instructions file (creates it if it
+doesn't exist yet); check `~/.codex/AGENTS.md` first if you already have
+one, so this doesn't get added twice:
+
+```bash
+mkdir -p ~/.codex
+cat skills/computer-history/AGENTS.md >> ~/.codex/AGENTS.md
+```
+
+Either file only helps once the Collector is actually installed and has
+captured some history — see Install, above.
+
 ## Development
 
 ```bash
