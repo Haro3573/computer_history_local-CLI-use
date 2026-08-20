@@ -30,16 +30,15 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
-from datetime import UTC, date, datetime
+from datetime import date
 from pathlib import Path
 
 from .collector import DEFAULT_INTERVAL_SECONDS, run_forever
 from .launch_agent import install, status, uninstall
 from .memory_pipeline import DEFAULT_MEMORY_DIR, preview, summarize_once
 from .pipeline_store import PipelineStore
-from .providers.claude_cli import ClaudeCliProvider, DaySummaryState
-from .providers.fake import FakeProvider
-from .retrieval import ask_preview, gather_all_daily_memories, lookup
+from .providers import PROVIDER_CHOICES, provider_for
+from .retrieval import MemoryFileMissingError, ask_once, ask_preview, lookup
 from .store import DEFAULT_STORE, Store
 
 
@@ -69,7 +68,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # free preview path below never reads args.provider at all), so this
     # stays optional in argparse's eyes; main() enforces it's set before
     # a --send run ever reaches a provider.
-    summarize_parser.add_argument("--provider", choices=("fake", "claude-cli"), default=None)
+    summarize_parser.add_argument("--provider", choices=PROVIDER_CHOICES, default=None)
     # Off by default -- Transfer's own consent gate (CONTEXT.md), the same
     # shape as `adhd_lifelog`'s `now --send`. Without it nothing is called
     # and nothing is written.
@@ -97,10 +96,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ask_parser.add_argument("--store", type=Path, default=None)
     ask_parser.add_argument("question")
     # No default -- see ADR-0008, same reasoning as `summarize`'s --provider.
-    ask_parser.add_argument("--provider", choices=("fake", "claude-cli"), default=None)
+    ask_parser.add_argument("--provider", choices=PROVIDER_CHOICES, default=None)
     ask_parser.add_argument("--send", action="store_true")
 
     return parser.parse_args(argv)
+
+
+def _provider_or_exit(name: str | None):
+    """`provider_for(name)`, or refuse -- ADR-0008: no default provider once
+    `--send` is in play, since a forgotten `--provider` used to silently
+    resolve to `fake` and advance the Watermark past a day that was never
+    really summarized. Shared by `summarize --send` and `ask --send`."""
+    if name is None:
+        print(f"--provider is required with --send (choices: {', '.join(PROVIDER_CHOICES)})")
+        sys.exit(1)
+    return provider_for(name)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -158,13 +168,7 @@ def main(argv: list[str] | None = None) -> None:
             print()
             print("pass --send to call the provider and write memories")
             return
-        if args.provider is None:
-            # ADR-0008: no default provider once --send is in play -- a
-            # forgotten --provider used to silently resolve to `fake` and
-            # advance the Watermark past a day that was never really
-            # summarized.
-            print("--provider is required with --send (choices: fake, claude-cli)")
-            sys.exit(1)
+        provider = _provider_or_exit(args.provider)
         if args.reprocess is not None and args.provider == "fake":
             # --reprocess overwrites a real day's file+index (OR REPLACE)
             # and never touches the Watermark either way -- if that
@@ -176,7 +180,6 @@ def main(argv: list[str] | None = None) -> None:
                 "Daily memory with placeholder text, permanently -- a later plain run "
                 "will never re-summarize it for real, since it's still 'already covered'."
             )
-        provider = FakeProvider() if args.provider == "fake" else ClaudeCliProvider()
         try:
             with Store(store_path) as store, PipelineStore(store_path) as pipeline_store:
                 outcomes = summarize_once(
@@ -208,6 +211,9 @@ def main(argv: list[str] | None = None) -> None:
         except sqlite3.OperationalError as exc:
             print(f"failed to open the store: {exc}")
             sys.exit(1)
+        except MemoryFileMissingError as exc:
+            print(str(exc))
+            sys.exit(1)
         if not result.dates:
             missing = ", ".join(d.isoformat() for d in result.missing)
             print(f"no Daily memory for: {missing}")
@@ -220,40 +226,43 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "ask":
         store_path = args.store if args.store is not None else DEFAULT_STORE
-        if args.send and args.provider is None:
-            # ADR-0008, same reasoning as `summarize`'s own check.
-            print("--provider is required with --send (choices: fake, claude-cli)")
-            sys.exit(1)
-        try:
-            with PipelineStore(store_path) as pipeline_store:
-                if not args.send:
+        if not args.send:
+            try:
+                with PipelineStore(store_path) as pipeline_store:
                     # Free, no-network preview -- no provider call, same
                     # shape as `summarize`'s own preview (ticket #17).
                     ask_preview_result = ask_preview(pipeline_store)
-                    if not ask_preview_result.dates:
-                        print("no Daily memory exists yet")
-                        sys.exit(1)
-                    print(
-                        f"{len(ask_preview_result.dates)} day(s), "
-                        f"{ask_preview_result.total_chars} chars total:"
-                    )
-                    for day in ask_preview_result.dates:
-                        print(f"  {day.isoformat()}")
-                    print()
-                    print("pass --send to call the provider and get an answer")
-                    return
-                day_contents = gather_all_daily_memories(pipeline_store)
+            except sqlite3.OperationalError as exc:
+                print(f"failed to open the store: {exc}")
+                sys.exit(1)
+            except MemoryFileMissingError as exc:
+                print(str(exc))
+                sys.exit(1)
+            if not ask_preview_result.dates:
+                print("no Daily memory exists yet")
+                sys.exit(1)
+            print(
+                f"{len(ask_preview_result.dates)} day(s), "
+                f"{ask_preview_result.total_chars} chars total:"
+            )
+            for day in ask_preview_result.dates:
+                print(f"  {day.isoformat()}")
+            print()
+            print("pass --send to call the provider and get an answer")
+            return
+
+        provider = _provider_or_exit(args.provider)
+        try:
+            with PipelineStore(store_path) as pipeline_store:
+                result = ask_once(pipeline_store, provider, args.question)
         except sqlite3.OperationalError as exc:
             print(f"failed to open the store: {exc}")
             sys.exit(1)
-        if not day_contents:
-            print("no Daily memory exists yet")
+        except MemoryFileMissingError as exc:
+            print(str(exc))
             sys.exit(1)
-        provider = FakeProvider() if args.provider == "fake" else ClaudeCliProvider()
-        today = datetime.now(UTC).astimezone().date()
-        result = provider.answer(args.question, day_contents, today=today)
-        if result.state != DaySummaryState.COMPLETED:
-            print(f"failed: {result.error_message}")
+        if not result.answered:
+            print("no Daily memory exists yet" if result.empty_corpus else f"failed: {result.error}")
             sys.exit(1)
         print(result.answer)
         if result.cited_dates:
