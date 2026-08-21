@@ -11,11 +11,12 @@ See [CONTEXT.md](CONTEXT.md) for the domain glossary and architecture,
 
 ## How it works
 
-Three views of the same system, at three zoom levels: what a person does at
-the terminal, which modules that triggers, and what happens to one piece of
-activity data from the moment it's polled to the moment it's read back.
+Four views of the same system: what a person does at the terminal, which
+modules that triggers, what happens to one piece of activity data from the
+moment it's polled to the moment it's read back, and the same for one AI
+session file.
 
-Teal is the one color code that repeats across all three diagrams below —
+Teal is the one color code that repeats across all four diagrams below —
 **stays on this Mac**. Amber is the opposite — **leaves this Mac**, and only
 ever happens where `--send` appears explicitly.
 
@@ -142,6 +143,49 @@ cursor` can advance (`ADR-0009`). It reaches `ask --send` exactly as it sits
 in the source file (`ADR-0010`), which is the one real asymmetry with the
 lifecycle above: read `ADR-0010` before running `ask --send` over a day
 where you pasted a real credential into a Claude Code or Codex session.
+
+### AI session lifecycle
+
+```mermaid
+flowchart TD
+    Raw["Raw session file<br/>Claude Code / Codex JSONL<br/>written by that tool, not this project"]
+    Filtered["Noise filtered<br/>isMeta · compaction summary · interrupt · XML"]
+    Stripped["Code + log stripped<br/>[code] / [log output] tags"]
+    Live["Read live, every call<br/>today only, never cached (ADR-0009)"]
+    Cursor["Session cursor<br/>byte offset, incremental re-read"]
+    Ollama["Session processor — Ollama<br/>qwen3.5:4b, think:false<br/>one paragraph per day"]
+    CharCap["Session processor — reduce_turns<br/>role-capped truncation (fallback)"]
+    Slice["Session slice<br/>raw_turns + reduced text, state.sqlite3"]
+    File["sessions/YYYY-MM-DD.md<br/>+ session_memory_index"]
+    Read["Retrieval — retrieve · ask<br/>own AI sessions section"]
+    Cloud(["Claude<br/>cloud, ask --send only"]):::transfer
+
+    Raw --> Filtered --> Stripped
+    Stripped -->|today| Live
+    Stripped -->|any other day| Cursor
+    Cursor --> Ollama
+    Ollama -.->|this day's call fails| CharCap
+    Ollama --> Slice
+    CharCap --> Slice
+    Slice --> File
+    Live --> Read
+    File --> Read
+    Read -->|"ask --send, unredacted (ADR-0010)"| Cloud
+
+    classDef transfer fill:#f5e7d8,stroke:#a85419,color:#a85419,stroke-width:1.5px,stroke-dasharray: 4 3;
+```
+
+One session file, followed from raw JSONL to something `ask` can draw an
+answer from. Noise filtering and code/log stripping happen before either
+`Session processor` ever sees the text, whether or not an LLM is involved.
+Today always takes the live branch — read fresh on every call, never
+written anywhere; every other day goes through the `Session cursor` so a
+resumed conversation only costs re-reading its new tail. `process-sessions`
+refuses to run at all if Ollama isn't reachable (no silently-degraded
+corpus), but a single day's call failing mid-run falls back to
+`reduce_turns` for that one day only, flagged in the run's own output. The
+dashed amber edge is the one place this content can leave the machine —
+`ask --send`, and only that, unredacted (`ADR-0010`).
 
 ## What this collects
 
