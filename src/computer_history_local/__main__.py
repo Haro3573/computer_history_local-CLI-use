@@ -37,6 +37,7 @@ from pathlib import Path
 from .collector import DEFAULT_INTERVAL_SECONDS, run_forever
 from .launch_agent import install, status, uninstall
 from .memory_pipeline import DEFAULT_MEMORY_DIR, preview, summarize_once
+from .ollama_processor import OllamaSessionProcessor, OllamaUnavailableError, check_available
 from .pipeline_store import PipelineStore
 from .providers import PROVIDER_CHOICES, provider_for
 from .retrieval import MemoryFileMissingError, ask_once, ask_preview, lookup
@@ -218,9 +219,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "process-sessions":
         store_path = args.store if args.store is not None else DEFAULT_STORE
         sessions_dir = args.sessions_dir if args.sessions_dir is not None else DEFAULT_SESSIONS_DIR
+        # No default-off, no flag to skip this check (ticket #32): a corpus
+        # where some days are LLM-summarized and others silently fell back
+        # to char-cap because Ollama happened to be down is worse than a
+        # loud refusal telling you to start it.
+        try:
+            check_available()
+        except OllamaUnavailableError as exc:
+            print(f"process-sessions requires Ollama: {exc}")
+            sys.exit(1)
+        session_processor = OllamaSessionProcessor()
         try:
             with SessionStore(store_path) as session_store:
-                result = process_sessions_once(session_store, sessions_dir=sessions_dir)
+                result = process_sessions_once(
+                    session_store, sessions_dir=sessions_dir, session_processor=session_processor
+                )
         except sqlite3.OperationalError as exc:
             print(f"failed to open the store: {exc}")
             sys.exit(1)
@@ -230,6 +243,11 @@ def main(argv: list[str] | None = None) -> None:
             f"{result.new_turn_count} new turn(s)"
         )
         print("days updated: " + ", ".join(result.days_written) if result.days_written else "nothing new")
+        if result.fallback_days:
+            print(
+                "fell back to char-cap (Ollama call failed for): "
+                + ", ".join(result.fallback_days)
+            )
         for error in result.errors:
             print(f"error: {error}")
         return

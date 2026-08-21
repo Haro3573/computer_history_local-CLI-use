@@ -67,6 +67,7 @@ flowchart TD
         Files["Daily memory + index<br/>memories/*.md · memory_index"]
         AISessions["AI session files<br/>~/.claude/projects · ~/.codex/sessions<br/>written by Claude Code/Codex, not this project"]
         SessionPipeline["Session pipeline<br/>process-sessions<br/>cursor-gated, no consent gate (ADR-0009)"]
+        Ollama(["Ollama<br/>qwen3.5:4b, localhost only<br/>Session processor"])
         SessionFiles["Session slices + index<br/>sessions/*.md · session_memory_index"]
         Retrieval["Retrieval<br/>lookup() · ask_once()"]
         CLI["__main__.py<br/>your terminal"]
@@ -77,6 +78,8 @@ flowchart TD
         Files -->|read| Retrieval
         AISessions -->|read, no redaction| SessionPipeline
         AISessions -.->|today: read live, never cached| Retrieval
+        SessionPipeline -->|"one call per day"| Ollama
+        Ollama -->|paragraph| SessionPipeline
         SessionPipeline -->|write, advance cursor| SessionFiles
         SessionFiles -->|read| Retrieval
         Retrieval -->|print| CLI
@@ -93,13 +96,19 @@ flowchart TD
 
 Two sources feed `Retrieval`, converging only there. `FakeProvider` and
 `ClaudeCliProvider` sit behind one seam (`providers.provider_for`) — the
-diagram's dashed amber edges are still the only two places a network call
+diagram's dashed amber edges are still the only two places a *network* call
 can occur, and both only fire when `--send` is passed with an explicit
-provider. The `AI session files` source is different in kind from
-everything to its left: it isn't captured by anything this project runs,
-carries no consent gate of its own (`ADR-0009`), and — unlike every other
-path into `Retrieval` — is never redacted before it can reach `ask --send`
-(`ADR-0010`).
+provider. `Ollama` looks similar in the diagram but isn't one of them: it's
+`localhost`-only, never a real network hop, which is exactly why it's drawn
+solid and un-amber like everything else on this Mac. It's the real
+`Session processor` — one local call per day, summarizing that day's AI
+session activity into a paragraph — and `process-sessions` refuses to run
+at all if it isn't reachable, rather than quietly falling back to a
+worse, character-truncated version of every day. The `AI session files`
+source itself is different in kind from everything to its left: it isn't
+captured by anything this project runs, carries no consent gate of its own
+(`ADR-0009`), and — unlike every other path into `Retrieval` — is never
+redacted before it can reach `ask --send` (`ADR-0010`).
 
 ### Data lifecycle
 
@@ -185,6 +194,10 @@ A fifth source works differently and sits outside the Collector entirely:
   needing a full re-read of the original file. That's a real, deliberate
   copy of your own AI conversation history sitting in local SQLite, not
   just a live pass-through — a design tradeoff, not an oversight.
+  `process-sessions`'s day-level summaries are written by a local model
+  (Ollama, `qwen3.5:4b`) rather than a plain truncation — still nothing
+  leaving this Mac (Ollama's API is `localhost`-only), just a better
+  reduction than character-capping could give.
 
 Everything above stays on this Mac (`Capture` has no consent gate,
 `ADR-0004`; AI session reading has no consent gate either, `ADR-0009`)
@@ -207,6 +220,15 @@ without an explicit `--provider` (`ADR-0008`).
   want `process-sessions`/`retrieve`/`ask` to include AI session history.
   Neither is a hard dependency — `process-sessions` just finds nothing to
   read if you've used neither.
+- [Ollama](https://ollama.com), running, with `qwen3.5:4b` pulled
+  (`ollama pull qwen3.5:4b`) — required specifically for `process-sessions`,
+  which uses it as the real `Session processor` (one local call per day,
+  summarizing that day's AI session activity into a paragraph). Nothing
+  here reaches the network: Ollama's HTTP API is `localhost`-only. Without
+  it, `process-sessions` refuses to run rather than silently writing a
+  worse, character-truncated version of every day (`retrieve`/`ask` don't
+  need Ollama at all — they only ever read what `process-sessions` already
+  wrote, or today's session content live).
 
 ## Install
 
@@ -255,11 +277,18 @@ does this automatically yet either):
 python -m computer_history_local process-sessions
 ```
 
-Free and local, always — there's no `--send` here at all, since reading
-these files never leaves the machine either way (`ADR-0009`). Safe to run
-repeatedly: only newly appended turns since the last run are re-read
-(`Session cursor`), and the still-open session you're running this from is
-always skipped (`Live session`).
+Local, always — there's no `--send` here at all, since nothing reaches a
+real network (`ADR-0009`); Ollama's API is `localhost`-only. It does need
+Ollama itself running with `qwen3.5:4b` pulled, though: that's what
+actually summarizes each day into a paragraph, and `process-sessions`
+refuses to run at all rather than silently write a worse, char-truncated
+version of every day if it's not there. A specific day whose Ollama call
+times out or errors (Ollama otherwise reachable) falls back to the
+character-capped version for that one day only, and `process-sessions`
+tells you which days that happened to. Safe to run repeatedly: only newly
+appended turns since the last run are re-read (`Session cursor`), and the
+still-open session you're running this from is always skipped
+(`Live session`).
 
 **Look up a day, or a range, for free** (`Retrieval`'s deterministic half —
 no network call, no cost). Automatically includes that day's AI session

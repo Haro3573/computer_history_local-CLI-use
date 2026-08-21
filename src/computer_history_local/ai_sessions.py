@@ -12,18 +12,28 @@ only ever reads source files and reduces text in memory. It never persists
 anything -- the cursor/slice/index bookkeeping that makes reduction
 incremental lives in `session_store.py`, driven by `session_pipeline.py`.
 
-The reduction here (`reduce_turns`) is v1's one `Session processor` adapter:
-deterministic, no model call, adapted from `adhd_lifelog`'s own AI-session
-evidence design (role-capped budget, head+tail truncation, drop order) but
-without its anchor-picking step -- a real local model is the intended second
-adapter behind this same seam (`docs/later.md`), not a fancier deterministic
-one, so v1 keeps this half of the seam as simple as it can be.
+Two `Session processor` adapters live behind the same seam (ticket #32):
+`reduce_turns` here is the original deterministic one -- no model call,
+adapted from `adhd_lifelog`'s own AI-session evidence design (role-capped
+budget, head+tail truncation, drop order) but without its anchor-picking
+step. `OllamaSessionProcessor` (`ollama_processor.py`) is the real local-LLM
+one, day-level rather than turn-level. `reduce_turns` is still what a day
+falls back to when Ollama is unreachable mid-run or a specific day's call
+fails (`session_pipeline.py`) -- it never stopped being load-bearing once
+the LLM adapter existed.
+
+The noise filters and code/log/paste compression below (`isMeta`/compaction/
+interrupt/XML filtering, `strip_noise_blocks`) apply before *either*
+adapter runs -- adapted from a legacy project's own preparsing pipeline
+(`Personal_Inliner`), evaluated for reuse rather than re-derived from
+scratch.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -137,13 +147,34 @@ def _parse_timestamp(raw: object) -> datetime | None:
         return None
 
 
+# User-turn noise patterns that aren't actually a person's words -- adopted
+# from `Personal_Inliner`'s own parser filters (evaluated, not re-derived):
+# Claude Code injects the compaction-summary text as a `user`-role message
+# on context compaction, and an interrupt is the person pressing stop, not
+# saying anything. A `<`-prefixed body is hook output/skill-invocation XML,
+# same reasoning `isSidechain` already gets excluded for.
+_COMPACTION_SUMMARY_PREFIX = "This session is being continued from a previous conversation"
+_INTERRUPT_PREFIX = "[Request interrupted"
+
+
+def _is_user_noise(text: str) -> bool:
+    return (
+        text.startswith("<")
+        or text.startswith(_COMPACTION_SUMMARY_PREFIX)
+        or text.startswith(_INTERRUPT_PREFIX)
+    )
+
+
 def parse_claude_code_turns(lines: Iterable[str]) -> list[Turn]:
     """Claude Code's JSONL: one record per line, `type` is `"user"` or
     `"assistant"` for a message (also `"mode"`, `"attachment"`,
     `"file-history-snapshot"`, etc., which aren't messages at all and are
     skipped). `isSidechain` marks a subagent's own turn, not the main
-    conversation the person actually had -- excluded, same reasoning
-    `adhd_lifelog`'s own harness-noise filtering uses."""
+    conversation the person actually had; `isMeta` marks a harness-injected
+    record the person never wrote either -- both excluded, same reasoning.
+    A user turn that's compaction-summary text, an interrupt signal, or
+    XML-tagged hook/skill output (`_is_user_noise`) is filtered too: none of
+    it is something the person actually said."""
     turns: list[Turn] = []
     for line in lines:
         line = line.strip()
@@ -155,12 +186,17 @@ def parse_claude_code_turns(lines: Iterable[str]) -> list[Turn]:
             continue
         if record.get("type") not in (ROLE_USER, ROLE_ASSISTANT):
             continue
-        if record.get("isSidechain"):
+        if record.get("isSidechain") or record.get("isMeta"):
             continue
         message = record.get("message")
         if not isinstance(message, dict):
             continue
         text = _claude_code_text(message.get("content")).strip()
+        if not text:
+            continue
+        if record["type"] == ROLE_USER and _is_user_noise(text):
+            continue
+        text = strip_noise_blocks(text)
         if not text:
             continue
         at = _parse_timestamp(record.get("timestamp"))
@@ -212,6 +248,9 @@ def parse_codex_turns(lines: Iterable[str]) -> list[Turn]:
         text = _codex_text(payload.get("content")).strip()
         if not text:
             continue
+        text = strip_noise_blocks(text)
+        if not text:
+            continue
         at = _parse_timestamp(record.get("timestamp"))
         if at is None:
             continue
@@ -220,6 +259,45 @@ def parse_codex_turns(lines: Iterable[str]) -> list[Turn]:
 
 
 PARSERS = {TOOL_CLAUDE_CODE: parse_claude_code_turns, TOOL_CODEX: parse_codex_turns}
+
+
+_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_LOG_LINE_RE = re.compile(
+    r"^(?:"
+    r"\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}"        # 2026-08-17 10:30 timestamp
+    r"|\[(?:INFO|DEBUG|WARN|WARNING|ERROR|TRACE)\]"  # [INFO] style prefix
+    r"|(?:INFO|DEBUG|WARN|WARNING|ERROR):\s"         # INFO: style prefix
+    r")",
+    re.IGNORECASE,
+)
+_LOG_RUN_MIN = 4  # minimum consecutive log-shaped lines before collapsing
+
+
+def strip_noise_blocks(text: str) -> str:
+    """Replace fenced code blocks and runs of structured log output with
+    placeholder tags, before any reduction step (deterministic or LLM) ever
+    sees the text -- adapted from `Personal_Inliner`'s own
+    `_compress_assistant_turn` (evaluated for reuse, ticket #32). All prose
+    is preserved: only content with no behavioral/narrative signal is
+    removed, so a code dump or a pasted stack trace doesn't eat the char
+    budget (`reduce_turns`) or crowd out an LLM's actual context."""
+    text = _CODE_BLOCK_RE.sub("[code]", text)
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if _LOG_LINE_RE.match(lines[i]):
+            j = i
+            while j < len(lines) and _LOG_LINE_RE.match(lines[j]):
+                j += 1
+            if j - i >= _LOG_RUN_MIN:
+                out.append("[log output]")
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    text = "\n".join(out)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 @dataclass(frozen=True)
