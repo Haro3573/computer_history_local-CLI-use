@@ -23,7 +23,7 @@ from pathlib import Path
 from .collector import DEFAULT_INTERVAL_SECONDS
 from .store import DEFAULT_STORE, Store
 
-LABEL = "com.sehyeokpark.computer-history-local.collector"
+LABEL = "local.computer-history-local.collector"
 AGENTS_DIR = Path("~/Library/LaunchAgents")
 LOG_DIR = Path("~/.local/share/computer-history-local")
 

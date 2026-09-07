@@ -34,7 +34,7 @@ from .store import KIND_SYSTEM, Observation, Insert, Store
 
 PMSET = "/usr/bin/pmset"
 
-# 2026-08-03 13:38:04 +0900 Sleep               \tEntering Sleep state due to...
+# 2026-01-15 13:38:04 +0900 Sleep               \tEntering Sleep state due to...
 #
 # The entry type is a padded column, read as the whole column rather than a
 # prefix -- `Wake Requests` is a different entry type from `Wake` (the
