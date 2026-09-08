@@ -1,413 +1,69 @@
 # computer_history_local
 
-A local, OpenAI/ChatGPT-independent equivalent of ChatGPT's Computer History:
-broad macOS activity capture, summarized into local memory, retrievable
-later. Built for one person, this Mac, cloud APIs first and local models
-last.
-
-See [CONTEXT.md](CONTEXT.md) for the domain glossary and architecture,
-[docs/adr/](docs/adr/) for why specific decisions were made, and
-[docs/later.md](docs/later.md) for ideas considered and deferred.
-
-## How it works
-
-Four views of the same system: what a person does at the terminal, which
-modules that triggers, what happens to one piece of activity data from the
-moment it's polled to the moment it's read back, and the same for one AI
-session file.
-
-Teal is the one color code that repeats across all four diagrams below —
-**stays on this Mac**. Amber is the opposite — **leaves this Mac**, and only
-ever happens where `--send` appears explicitly.
-
-### User flow
-
-```mermaid
-flowchart TD
-    Install(["install"]) --> Collector[["Collector — runs continuously<br/>30s poll + sleep/wake log"]]:::local
-    Collector -.-> Summarize["summarize"]
-    Collector -.-> Retrieve["retrieve date"]
-    Collector -.-> Ask["ask (free-text question)"]
-    ProcessSessions[["process-sessions — reads Claude Code/Codex<br/>session files directly, no install needed"]]:::local
-    ProcessSessions -.-> Retrieve
-    ProcessSessions -.-> Ask
-    Uninstall(["uninstall"]) -. stops .-> Collector
-
-    Summarize --> SPreview["no --send: preview only"]
-    SPreview -->|"--provider X --send"| SSend["Provider call — leaves this Mac"]:::transfer
-    SSend --> SDone["Daily memory file written"]
-
-    Retrieve --> RDone["always free — local files only"]
-
-    Ask --> APreview["no --send: preview only"]
-    APreview -->|"--provider X --send"| ASend["Provider call — leaves this Mac"]:::transfer
-    ASend --> ADone["Answer + cited dates"]
-
-    classDef local fill:#e4efec,stroke:#0f6b63,color:#0f6b63,stroke-width:1.5px;
-    classDef transfer fill:#f5e7d8,stroke:#a85419,color:#a85419,stroke-width:1.5px,stroke-dasharray: 4 3;
-```
-
-One `install` starts the Collector running unattended. `process-sessions` is
-the second, independent entry point — it needs no install and no Collector,
-since it reads session files Claude Code and Codex already wrote themselves
-(`ADR-0009`). Everything else runs whenever you like. Both consent gates are
-the same shape: no default provider, so `--send` without an explicit
-`--provider` refuses outright rather than guessing (`ADR-0008`). `uninstall`
-only ever touches the LaunchAgent — captured data and generated memories are
-never deleted by it.
-
-### Architecture
-
-```mermaid
-flowchart TD
-    subgraph Mac["This Mac"]
-        direction TB
-        Collector["Collector<br/>window / idle / browser / sleep-wake<br/>polls every 30s"]
-        Store["Store<br/>state_samples table<br/>Pulsetime merge, 5 min"]
-        Pipeline["Memory Pipeline<br/>build_spans → day_chunks<br/>Watermark-gated (ADR-0005)"]
-        Files["Daily memory + index<br/>memories/*.md · memory_index"]
-        AISessions["AI session files<br/>~/.claude/projects · ~/.codex/sessions<br/>written by Claude Code/Codex, not this project"]
-        SessionPipeline["Session pipeline<br/>process-sessions<br/>cursor-gated, no consent gate (ADR-0009)"]
-        Ollama(["Ollama<br/>qwen3.5:4b, localhost only<br/>Session processor"])
-        SessionFiles["Session slices + index<br/>sessions/*.md · session_memory_index"]
-        Retrieval["Retrieval<br/>lookup() · ask_once()"]
-        CLI["__main__.py<br/>your terminal"]
-
-        Collector -->|redact + write| Store
-        Store -->|pending days| Pipeline
-        Pipeline -->|write, advance Watermark| Files
-        Files -->|read| Retrieval
-        AISessions -->|read, no redaction| SessionPipeline
-        AISessions -.->|today: read live, never cached| Retrieval
-        SessionPipeline -->|"one call per day"| Ollama
-        Ollama -->|paragraph| SessionPipeline
-        SessionPipeline -->|write, advance cursor| SessionFiles
-        SessionFiles -->|read| Retrieval
-        Retrieval -->|print| CLI
-    end
-
-    Cloud(["Claude<br/>cloud, via local `claude` CLI"]):::transfer
-    Pipeline -->|"chunk (--send)"| Cloud
-    Cloud -->|summaries| Pipeline
-    Retrieval -->|"days (ask --send)"| Cloud
-    Cloud -->|answer| Retrieval
-
-    classDef transfer fill:#f5e7d8,stroke:#a85419,color:#a85419,stroke-width:1.5px,stroke-dasharray: 4 3;
-```
-
-Two sources feed `Retrieval`, converging only there. `FakeProvider` and
-`ClaudeCliProvider` sit behind one seam (`providers.provider_for`) — the
-diagram's dashed amber edges are still the only two places a *network* call
-can occur, and both only fire when `--send` is passed with an explicit
-provider. `Ollama` looks similar in the diagram but isn't one of them: it's
-`localhost`-only, never a real network hop, which is exactly why it's drawn
-solid and un-amber like everything else on this Mac. It's the real
-`Session processor` — one local call per day, summarizing that day's AI
-session activity into a paragraph — and `process-sessions` refuses to run
-at all if it isn't reachable, rather than quietly falling back to a
-worse, character-truncated version of every day. The `AI session files`
-source itself is different in kind from everything to its left: it isn't
-captured by anything this project runs, carries no consent gate of its own
-(`ADR-0009`), and — unlike every other path into `Retrieval` — is never
-redacted before it can reach `ask --send` (`ADR-0010`).
-
-### Data lifecycle
-
-```mermaid
-flowchart LR
-    Raw["Raw signal<br/>app / window / URL, idle, pmset log"]
-    Redacted["Redacted<br/>secret patterns + URL sanitize"]
-    Sample["State sample<br/>Pulsetime-merged, stored indefinitely"]
-    Batched["Batched + chunked<br/>one calendar day, ≤4,000 chars"]
-    Provider["Provider call<br/>leaves this Mac"]:::transfer
-    Entry["Timeline entry<br/>time range → summary → apps"]
-    File["Daily memory file<br/>+ memory_index row"]
-    Read["Read later — free<br/>retrieve · ask"]
-
-    Raw --> Redacted --> Sample --> Batched --> Provider --> Entry --> File --> Read
-
-    classDef transfer fill:#f5e7d8,stroke:#a85419,color:#a85419,stroke-width:1.5px,stroke-dasharray: 4 3;
-```
-
-One poll of the frontmost window, followed from raw signal to something you
-can ask a question about. Redaction happens before the first write
-(`ADR-0006`). A `State sample` can then sit in local storage indefinitely —
-Capture has no consent gate (`ADR-0004`). The Provider call is the one stage
-that isn't local, and it's the only stage gated by consent. The `Watermark`
-only advances once that write has actually succeeded (`ADR-0005`).
-
-An `AI session` follows a shorter, different path: it's already text on
-disk, written by Claude Code or Codex, not a raw signal this project polls
-— so there's no redaction stage, and no consent gate before the `Session
-cursor` can advance (`ADR-0009`). It reaches `ask --send` exactly as it sits
-in the source file (`ADR-0010`), which is the one real asymmetry with the
-lifecycle above: read `ADR-0010` before running `ask --send` over a day
-where you pasted a real credential into a Claude Code or Codex session.
-
-### AI session lifecycle
-
-```mermaid
-flowchart TD
-    Raw["Raw session file<br/>Claude Code / Codex JSONL<br/>written by that tool, not this project"]
-    Filtered["Noise filtered<br/>isMeta · compaction summary · interrupt · XML"]
-    Stripped["Code + log stripped<br/>[code] / [log output] tags"]
-    Live["Read live, every call<br/>today only, never cached (ADR-0009)"]
-    Cursor["Session cursor<br/>byte offset, incremental re-read"]
-    Ollama["Session processor — Ollama<br/>qwen3.5:4b, think:false<br/>one paragraph per day"]
-    CharCap["Session processor — reduce_turns<br/>role-capped truncation (fallback)"]
-    Slice["Session slice<br/>raw_turns + reduced text, state.sqlite3"]
-    File["sessions/YYYY-MM-DD.md<br/>+ session_memory_index"]
-    Read["Retrieval — retrieve · ask<br/>own AI sessions section"]
-    Cloud(["Claude<br/>cloud, ask --send only"]):::transfer
-
-    Raw --> Filtered --> Stripped
-    Stripped -->|today| Live
-    Stripped -->|any other day| Cursor
-    Cursor --> Ollama
-    Ollama -.->|this day's call fails| CharCap
-    Ollama --> Slice
-    CharCap --> Slice
-    Slice --> File
-    Live --> Read
-    File --> Read
-    Read -->|"ask --send, unredacted (ADR-0010)"| Cloud
-
-    classDef transfer fill:#f5e7d8,stroke:#a85419,color:#a85419,stroke-width:1.5px,stroke-dasharray: 4 3;
-```
-
-One session file, followed from raw JSONL to something `ask` can draw an
-answer from. Noise filtering and code/log stripping happen before either
-`Session processor` ever sees the text, whether or not an LLM is involved.
-Today always takes the live branch — read fresh on every call, never
-written anywhere; every other day goes through the `Session cursor` so a
-resumed conversation only costs re-reading its new tail. `process-sessions`
-refuses to run at all if Ollama isn't reachable (no silently-degraded
-corpus), but a single day's call failing mid-run falls back to
-`reduce_turns` for that one day only, flagged in the run's own output. The
-dashed amber edge is the one place this content can leave the machine —
-`ask --send`, and only that, unredacted (`ADR-0010`).
+A local, OpenAI/ChatGPT-independent equivalent of ChatGPT's Computer
+History: broad macOS activity capture, summarized into local memory,
+retrievable later. Built for one person, this Mac.
 
 ## What this collects
 
-Four channels, all written to one local `state.sqlite3`:
+Four channels, all written to one local `state.sqlite3`: frontmost app +
+window title (redacted for secrets before it's ever written), idle/away
+(a boolean, no duration), browser URL (Chrome/Safari/Arc/Brave, origin +
+path only, no query/fragment/credentials), and sleep/wake (from macOS's
+own `pmset` log). **Never captured, at any point**: keystrokes, clicks, or
+screen/screenshot content.
 
-- **Frontmost app + window title** — polled every 30s via `osascript`. The
-  window title needs Accessibility permission; without it, only the app
-  name is captured. Passed through a redactor before it's ever written —
-  API keys, bearer tokens, AWS access keys, and generic `key=value` secret
-  assignments become `[REDACTED:...]` markers, since a terminal's window
-  title is often its own command line.
-- **Idle / away** — a boolean only, read from macOS's own idle timer:
-  away past 3 minutes of no input, active otherwise. The precise idle
-  duration itself is never stored, just whether the threshold was crossed.
-- **Browser URL** — Chrome, Safari, Arc, and Brave only, the front tab of
-  whichever is frontmost. Reduced to origin + path before it's ever
-  written — no query string, fragment, or embedded credentials ever reach
-  storage, since that's exactly where session tokens and search terms
-  live. Passed through the same redactor as window titles.
-- **Sleep / wake** — read back after the fact from `pmset -g log` (macOS's
-  own system log, no new permission needed), checked every 10 minutes, so
-  a gap in the other channels can be labeled "machine was asleep" rather
-  than "person walked away" or "Collector died."
-
-**Never captured by the Collector, at any point**: keystrokes, clicks, or
-screen/screenshot content. The Collector records that something changed,
-never what was typed or shown — see `ADR-0001` for why capture stops at
-that line.
-
-A fifth source works differently and sits outside the Collector entirely:
-
-- **AI session history** — Claude Code's and Codex's own local session
-  files (`~/.claude/projects/`, `~/.codex/sessions/`), read directly by
-  `process-sessions`/`retrieve`/`ask`, never written by anything this
-  project runs. This is deliberately the one place this project reads your
-  own typed words back — mirroring OpenAI's Computer History is the whole
-  point of this project (`CONTEXT.md`'s `AI session` entry), and that
-  means reading an agent's own past sessions, not just app/window
-  metadata. It has no consent gate (`ADR-0009`) and, unlike everything
-  above, is **never redacted** before it can reach `ask --send`
-  (`ADR-0010`) — read that ADR before running `ask --send` over a day
-  where you pasted a real credential into a session. The one session still
-  open right now is always excluded, since it's already in the calling
-  agent's own context (`CONTEXT.md`'s `Live session` entry). Unlike the
-  four channels above, this one *does* persist more than its final output:
-  `process-sessions` caches a reduced copy per day into `sessions/*.md`,
-  but also keeps the underlying turns it was reduced from in this
-  project's own `state.sqlite3` (`session_slices.raw_turns`), so a
-  resumed conversation can be re-reduced correctly next run instead of
-  needing a full re-read of the original file. That's a real, deliberate
-  copy of your own AI conversation history sitting in local SQLite, not
-  just a live pass-through — a design tradeoff, not an oversight.
-  `process-sessions`'s day-level summaries are written by a local model
-  (Ollama, `qwen3.5:4b`) rather than a plain truncation — still nothing
-  leaving this Mac (Ollama's API is `localhost`-only), just a better
-  reduction than character-capping could give.
-
-Everything above stays on this Mac (`Capture` has no consent gate,
-`ADR-0004`; AI session reading has no consent gate either, `ADR-0009`)
-until `summarize --send` or `ask --send` sends it to a cloud model — the
-only two commands that ever leave the machine, and both refuse to run
-without an explicit `--provider` (`ADR-0008`).
+Everything above stays on this Mac until `summarize --send` or
+`ask --send` sends it to a cloud model — the only two commands that ever
+leave the machine, and both require an explicit `--provider`.
 
 ## Requirements
 
-- macOS
-- Python 3.11+
+- macOS, Python 3.11+
 - [Claude Code](https://claude.com/claude-code)'s `claude` CLI, installed
-  and logged into a Claude subscription — `summarize --send` and `ask
-  --send` shell out to it (`claude -p`) rather than a metered API key, the
-  same reasoning `adhd_lifelog` uses. Nothing else needs a network call or
-  a new permission: `pmset` (sleep/wake) and window/idle capture are both
-  built into macOS.
-- Optional: having actually used [Claude Code](https://claude.com/claude-code)
-  and/or [Codex](https://developers.openai.com/codex) on this Mac, if you
-  want `process-sessions`/`retrieve`/`ask` to include AI session history.
-  Neither is a hard dependency — `process-sessions` just finds nothing to
-  read if you've used neither.
-- [Ollama](https://ollama.com), running, with `qwen3.5:4b` pulled
-  (`ollama pull qwen3.5:4b`) — required specifically for `process-sessions`,
-  which uses it as the real `Session processor` (one local call per day,
-  summarizing that day's AI session activity into a paragraph). Nothing
-  here reaches the network: Ollama's HTTP API is `localhost`-only. Without
-  it, `process-sessions` refuses to run rather than silently writing a
-  worse, character-truncated version of every day (`retrieve`/`ask` don't
-  need Ollama at all — they only ever read what `process-sessions` already
-  wrote, or today's session content live).
+  and logged into a Claude subscription — `summarize --send` and
+  `ask --send` shell out to it (`claude -p`) rather than a metered API key.
+- Optional: [Ollama](https://ollama.com), running, with `qwen3.5:4b`
+  pulled, for `process-sessions` (summarizes AI session history into a
+  paragraph, locally — nothing here reaches the network).
 
 ## Install
 
 ```bash
-git clone <this repo>
-cd computer_history_local
+git clone https://github.com/Haro3573/computer_history_local-CLI-use.git
+cd computer_history_local-CLI-use
 pip install -e .
 python -m computer_history_local install   # writes + loads a LaunchAgent
-```
-
-`install` starts the Collector running unattended in the background
-(window, idle, browser, and sleep/wake — see `CONTEXT.md`'s `State
-sample`/`System event` entries), and keeps it running across reboots.
-Check it's actually capturing:
-
-```bash
-python -m computer_history_local status
+python -m computer_history_local status    # confirm it's capturing
 ```
 
 ## Usage
 
 Everything below is `python -m computer_history_local <command>`. Data
-lives under `~/.local/share/computer-history-local/` — `state.sqlite3`
-(captured activity, the `Memory Pipeline`'s own index/watermark, and the
-`Session pipeline`'s cursor/index), `memories/*.md` (one file per day, once
-summarized), and `sessions/*.md` (one file per day with AI session content,
-once `process-sessions` has covered it).
-
-**Turn captured activity into a daily summary** (the `Memory Pipeline`,
-manually triggered — nothing does this automatically yet):
+lives under `~/.local/share/computer-history-local/`.
 
 ```bash
-python -m computer_history_local summarize                                   # free preview, no network call
-python -m computer_history_local summarize --provider claude-cli --send      # spends real Claude usage, writes files
+# Turn captured activity into a daily summary
+summarize                                    # free preview, no network call
+summarize --provider claude-cli --send       # spends real Claude usage, writes files
+
+# Fold Claude Code/Codex session history into local files, locally
+process-sessions
+
+# Look up a day, or a range, for free
+retrieve 2026-08-17
+retrieve 2026-08-15 2026-08-17
+
+# Ask a free-text question across everything summarized so far
+ask "what was I doing last week"                                 # free preview
+ask "what was I doing last week" --provider claude-cli --send    # spends real Claude usage
+
+# Stop the Collector; captured data and generated memories are left in place
+uninstall
 ```
 
-`--provider` has no default (`ADR-0008`) — it's required with `--send`, but
-never read on a plain preview run above. `fake` is a network-free stand-in
-provider for testing the wiring, not something you want against real data.
-
-**Fold Claude Code/Codex session history into local `sessions/*.md` files**
-(the `Session pipeline`, manually triggered, same as `summarize` — nothing
-does this automatically yet either):
-
-```bash
-python -m computer_history_local process-sessions
-```
-
-Local, always — there's no `--send` here at all, since nothing reaches a
-real network (`ADR-0009`); Ollama's API is `localhost`-only. It does need
-Ollama itself running with `qwen3.5:4b` pulled, though: that's what
-actually summarizes each day into a paragraph, and `process-sessions`
-refuses to run at all rather than silently write a worse, char-truncated
-version of every day if it's not there. A specific day whose Ollama call
-times out or errors (Ollama otherwise reachable) falls back to the
-character-capped version for that one day only, and `process-sessions`
-tells you which days that happened to. Safe to run repeatedly: only newly
-appended turns since the last run are re-read (`Session cursor`), and the
-still-open session you're running this from is always skipped
-(`Live session`).
-
-**Look up a day, or a range, for free** (`Retrieval`'s deterministic half —
-no network call, no cost). Automatically includes that day's AI session
-content too, as its own labeled section, when there is any — today's is
-read live even without ever running `process-sessions`:
-
-```bash
-python -m computer_history_local retrieve 2026-08-17
-python -m computer_history_local retrieve 2026-08-15 2026-08-17
-```
-
-**Ask a free-text question across every day summarized so far**
-(`Retrieval`'s paid half — reads every `Daily memory` file that exists, plus
-every day with AI session content, cached or today's live read):
-
-```bash
-python -m computer_history_local ask "what was I doing last week"                                       # free preview: which days, how many chars
-python -m computer_history_local ask "what was I doing last week" --provider claude-cli --send            # spends real Claude usage, answers
-```
-
-`--send` is the only thing that ever sends anything off this Mac — every
-command works, and nothing costs money or leaves the machine, without it.
-The one exception to "nothing costs money without `--send`" being free of
-consequence: once you do pass it, AI session content goes along unredacted
-(`ADR-0010`) — see "What this collects" above before relying on this over a
-day where you pasted a real credential into a Claude Code or Codex session.
-
-## Uninstall
-
-```bash
-python -m computer_history_local uninstall
-```
-
-Stops and removes the Collector's LaunchAgent. Captured data and generated
-memories under `~/.local/share/computer-history-local/` are left in place —
-`state.sqlite3`, `memories/*.md`, and `sessions/*.md` alike. `uninstall`
-only ever touches the LaunchAgent; `process-sessions` still works fine
-afterward, since it never depended on the Collector running.
-
-## Agent integration
-
-`skills/computer-history/` teaches an agent how to answer "what was I doing
-last week?" by calling this CLI, instead of guessing or fabricating an
-answer. Two files, one per tool, since Claude Code and Codex load
-instructions differently (Claude Code triggers a `SKILL.md` on demand;
-Codex always loads `AGENTS.md` for the whole session):
-
-**Claude Code** — install once so it's available in any project, not just
-this one:
-
-```bash
-mkdir -p ~/.claude/skills/computer-history
-cp skills/computer-history/SKILL.md ~/.claude/skills/computer-history/SKILL.md
-```
-
-**Codex** — append to the global instructions file (creates it if it
-doesn't exist yet); check `~/.codex/AGENTS.md` first if you already have
-one, so this doesn't get added twice:
-
-```bash
-mkdir -p ~/.codex
-cat skills/computer-history/AGENTS.md >> ~/.codex/AGENTS.md
-```
-
-Either file only helps once there's something to read — the Collector
-installed and running (see Install, above), or `process-sessions` run at
-least once against existing Claude Code/Codex history.
-
-## Development
-
-```bash
-pip install -e ".[dev]"
-python -m pytest -q
-```
-
-Issues and design decisions are tracked as GitHub issues, including
-Wayfinder maps (`wayfinder:map` label) for larger architecture questions —
-see `docs/agents/issue-tracker.md`.
+`--send` is the only thing that ever sends anything off this Mac. The one
+exception to "nothing costs money without `--send`" being free of
+consequence: once you do pass it, AI session content goes along
+unredacted — worth knowing before running `ask --send` over a day where
+you pasted a real credential into a Claude Code or Codex session.
