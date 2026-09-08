@@ -4,6 +4,10 @@ A local, OpenAI/ChatGPT-independent equivalent of ChatGPT's Computer
 History: broad macOS activity capture, summarized into local memory,
 retrievable later. Built for one person, this Mac.
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how this works end to end
+(diagrams included) and the full detail on what's collected — readable on
+its own, without installing or running anything.
+
 ## What this collects
 
 Four channels, all written to one local `state.sqlite3`: frontmost app +
